@@ -1,0 +1,4 @@
+# pnpm 11 把构建脚本审批移到 workspace 配置；esbuild（tsup/vitest 依赖）
+# 需要 postinstall 才能放置平台二进制。
+allowBuilds:
+  esbuild: true
