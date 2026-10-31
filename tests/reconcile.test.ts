@@ -185,3 +185,78 @@ describe('guards', () => {
     expect(base.diaryLimit).toBeGreaterThan(0)
   })
 })
+
+describe('digest cursor', () => {
+  it('feeds only undigested diaries, and a dry-run proposal parks them as pending', async () => {
+    const ws = makeWorkspace()
+    const config = loadConfig({
+      patch: { agentsFile: ws.agentsFile, memoryRoot: ws.memoryRoot, stateRoot: ws.stateRoot, digest: { onlyUndigested: true, limit: 10, diaryChars: 1000, maxInputChars: 20000 } },
+    })
+    const { loadCursor } = await import('../src/cursor.js')
+    const { loadPending, pendingFile } = await import('../src/reconcile.js')
+
+    const first = await run({ config, client: fakeClient(), logger: silentLogger(), dryRun: true, runId: 'run-1' })
+    expect(first.digestedIds).toHaveLength(2)
+    expect(first.pendingSaved).toBe(true)
+    const cursor = loadCursor(ws.stateRoot)
+    expect(Object.keys(cursor.proposed)).toHaveLength(2)
+    expect(Object.keys(cursor.digested)).toHaveLength(0)
+    expect(fs.existsSync(pendingFile(ws.stateRoot))).toBe(true)
+    expect(loadPending(config)?.runId).toBe('run-1')
+
+    // 第二次运行：没有新的未消化日记 → 明确报错而不是重复烧 token
+    await expect(run({ config, client: fakeClient(), logger: silentLogger() })).rejects.toThrow(/没有"未消化"的日记/u)
+  })
+
+  it('marks diaries digested only after a real write, and consumes the pending proposal', async () => {
+    const ws = makeWorkspace()
+    const config = loadConfig({
+      patch: { agentsFile: ws.agentsFile, memoryRoot: ws.memoryRoot, stateRoot: ws.stateRoot },
+    })
+    const { loadCursor } = await import('../src/cursor.js')
+    const { applyProposal, loadPending } = await import('../src/reconcile.js')
+
+    await run({ config, client: fakeClient(), logger: silentLogger(), dryRun: true, runId: 'run-1' })
+    const proposal = loadPending(config)
+    expect(proposal).toBeDefined()
+
+    const applied = applyProposal(config, proposal!, { runId: 'run-2' })
+    expect(applied.applied).toEqual({ assimilation: 1, accommodation: 1 })
+    expect(applied.snapshot).toBeDefined()
+    expect(fs.readFileSync(ws.agentsFile, 'utf8')).toContain('且不超三句')
+
+    const cursor = loadCursor(ws.stateRoot)
+    expect(Object.keys(cursor.digested)).toHaveLength(2)
+    expect(Object.keys(cursor.proposed)).toHaveLength(0)
+    expect(loadPending(config)).toBeUndefined()
+
+    // 再跑一次：全部已吸收
+    await expect(run({ config, client: fakeClient(), logger: silentLogger() })).rejects.toThrow(/没有"未消化"/u)
+  })
+
+  it('allows processing everything with onlyUndigested=false', async () => {
+    const ws = makeWorkspace()
+    const config = loadConfig({
+      patch: { agentsFile: ws.agentsFile, memoryRoot: ws.memoryRoot, stateRoot: ws.stateRoot, digest: { onlyUndigested: false, limit: 10, diaryChars: 1000, maxInputChars: 20000 } },
+    })
+    await run({ config, client: fakeClient(), logger: silentLogger(), dryRun: true, runId: 'run-1' })
+    const again = await run({ config, client: fakeClient(), logger: silentLogger(), dryRun: true, runId: 'run-2' })
+    expect(again.digestedIds).toHaveLength(2)
+    expect(again.skippedDigested).toBe(0)
+  })
+
+  it('counts undigested diaries and resets on demand', async () => {
+    const ws = makeWorkspace()
+    const { emptyCursor, countUndigested, markDigested, isSettled, markProposed, pendingEventIds, clearProposed } = await import('../src/cursor.js')
+    let cursor = emptyCursor()
+    expect(countUndigested(cursor, ['a', 'b'])).toBe(2)
+    cursor = markDigested(cursor, ['a'], 'r1')
+    expect(isSettled(cursor, 'a')).toBe(true)
+    expect(countUndigested(cursor, ['a', 'b'])).toBe(1)
+    cursor = markProposed(cursor, ['b'], 'r1')
+    expect(pendingEventIds(cursor)).toEqual(['b'])
+    cursor = clearProposed(cursor)
+    expect(pendingEventIds(cursor)).toEqual([])
+    void ws
+  })
+})

@@ -163,12 +163,22 @@ export interface DigestConfig {
 /** 消化游标：哪些日记已经被"吸收"进图式。 */
 export interface DigestCursor {
   version: number
-  /** eventId → 消化时间与所属运行批次。 */
+  /** eventId → 已吸收进图式的时间与批次。 */
   digested: Record<string, { at: string; runId: string }>
+  /** eventId → 已分析出建议、但还没落盘的时间与批次（避免定时反复烧 token）。 */
+  proposed: Record<string, { at: string; runId: string }>
   lastRunAt?: string
   lastRunId?: string
   /** 连续跳过次数（用于 daemon 日志）。 */
   skippedRuns?: number
+}
+
+/** 待落盘的建议（`analyze` 产出、`apply` 消费，避免二次调用模型）。 */
+export interface PendingProposal {
+  at: string
+  runId: string
+  analysis: Analysis
+  eventIds: string[]
 }
 
 export interface AutoSchemaConfig {
