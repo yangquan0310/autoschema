@@ -29,25 +29,63 @@ export function eventsDir(memoryRoot: string): string {
   return path.join(memoryRoot, 'events')
 }
 
-/** 列出所有事件的 id（不做排序）。 */
-export function listEventIds(memoryRoot: string): string[] {
-  const dir = eventsDir(memoryRoot)
-  let names: string[] = []
-  try {
-    names = fs.readdirSync(dir)
-  } catch {
-    return []
+/**
+ * 解析实际要扫描的日记目录。
+ *
+ * 优先用 `config.diaries.dirs`（可在 config.json 里配多个目录）；
+ * 为空且 `strict=false` 时回落到 `<memoryRoot>/events`。
+ */
+export function resolveDiaryDirs(config: {
+  memoryRoot: string
+  diaries?: { dirs?: string[]; strict?: boolean }
+}): string[] {
+  const configured = (config.diaries?.dirs ?? []).filter((dir) => typeof dir === 'string' && dir.trim() !== '')
+  if (configured.length > 0) return configured
+  if (config.diaries?.strict === true) return []
+  return [eventsDir(config.memoryRoot)]
+}
+
+/** 在给定目录里找某个事件文件（多目录时取第一个命中的）。 */
+function findEventFile(dirs: string[], name: string): string | undefined {
+  for (const dir of dirs) {
+    const file = path.join(dir, name)
+    if (fs.existsSync(file)) return file
   }
-  return names
-    .filter((name) => name.endsWith('.json') && !name.startsWith('_'))
-    .map((name) => name.slice(0, -'.json'.length))
+  return undefined
+}
+
+/**
+ * 列出所有事件的 id（多目录合并去重，不做排序）。
+ *
+ * 传字符串时把它当作**事件目录本身**（与 `readDiary` / `collectDiaries` 一致）；
+ * 从 AutoBioMemory 数据根找时用 `resolveDiaryDirs(config)` 或 `eventsDir(root)`。
+ */
+export function listEventIds(eventsDirOrDirs: string | string[]): string[] {
+  const dirs = Array.isArray(eventsDirOrDirs) ? eventsDirOrDirs : [eventsDirOrDirs]
+  const ids = new Set<string>()
+  for (const dir of dirs) {
+    let names: string[] = []
+    try {
+      names = fs.readdirSync(dir)
+    } catch {
+      continue
+    }
+    for (const name of names) {
+      if (!name.endsWith('.json') || name.startsWith('_')) continue
+      ids.add(name.slice(0, -'.json'.length))
+    }
+  }
+  return [...ids]
 }
 
 /** 读一篇日记；正文优先取 `.md`（那才是记忆本体），缺失时回落到 JSON。 */
-export function readDiary(memoryRoot: string, eventId: string): DiaryEntry | undefined {
-  const json = readJsonFile<RawEvent>(path.join(eventsDir(memoryRoot), `${eventId}.json`))
+export function readDiary(eventsDirOrDirs: string | string[], eventId: string): DiaryEntry | undefined {
+  const dirs = Array.isArray(eventsDirOrDirs) ? eventsDirOrDirs : [eventsDirOrDirs]
+  const jsonFile = findEventFile(dirs, `${eventId}.json`)
+  if (jsonFile === undefined) return undefined
+  const json = readJsonFile<RawEvent>(jsonFile)
   if (json === undefined) return undefined
-  const md = readTextFile(path.join(eventsDir(memoryRoot), `${eventId}.md`))
+  const md = readTextFile(path.join(path.dirname(jsonFile), `${eventId}.md`))
   const diary = (md ?? json.diary ?? '').trim()
   if (diary === '') return undefined
   const structured = json.structured ?? {}
@@ -80,10 +118,10 @@ export interface DiaryQuery {
  *
  * 时间取 `structured.startedAt`，无法解析时按事件 id 里的时间戳排序（id 里带了北京时间）。
  */
-export function collectDiaries(memoryRoot: string, query: DiaryQuery): DiaryEntry[] {
+export function collectDiaries(eventsDirOrDirs: string | string[], query: DiaryQuery): DiaryEntry[] {
   const entries: DiaryEntry[] = []
-  for (const id of listEventIds(memoryRoot)) {
-    const entry = readDiary(memoryRoot, id)
+  for (const id of listEventIds(eventsDirOrDirs)) {
+    const entry = readDiary(eventsDirOrDirs, id)
     if (entry !== undefined) entries.push(entry)
   }
   const timeOf = (entry: DiaryEntry): number => {

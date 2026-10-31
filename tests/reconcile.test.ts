@@ -1,11 +1,24 @@
-import { describe, expect, it } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { defaultConfig, loadConfig } from '../src/config.js'
-import { gatherDiaries, listHistory, readSchema, renderReport, run, snapshotSchema } from '../src/reconcile.js'
-import { readDiary } from '../src/diaries.js'
+import { describe, expect, it } from 'vitest'
+
+import { loadConfig } from '../src/config.js'
+import { listEventIds, readDiary, resolveDiaryDirs } from '../src/diaries.js'
+import { emptyCursor, loadCursor, markDigested, saveCursor } from '../src/cursor.js'
+import {
+  applyPending,
+  applySelected,
+  clearPending,
+  gatherDiaries,
+  listHistory,
+  loadPending,
+  propose,
+  readSchema,
+  renderReport,
+  snapshotSchema,
+} from '../src/reconcile.js'
 import { parseSchemaDoc } from '../src/agents-md.js'
 import { silentLogger } from '../src/util.js'
 import type { ChatClient } from '../src/types.js'
@@ -27,236 +40,227 @@ const AGENTS = `# 风格
 > **说明：** 价值观指发生冲突时的排序。
 
 - 安全 > 进度
+- 事实 > 面子
 `
 
-function makeWorkspace(): { agentsFile: string; memoryRoot: string; stateRoot: string } {
+function makeWorkspace(diaryCount = 2): {
+  root: string
+  agentsFile: string
+  memoryRoot: string
+  stateRoot: string
+} {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'autoschema-run-'))
   const agentsFile = path.join(root, 'AGENTS.md')
   fs.writeFileSync(agentsFile, AGENTS)
   const memoryRoot = path.join(root, 'mem')
-  fs.mkdirSync(path.join(memoryRoot, 'events'), { recursive: true })
-  const events = [
-    { id: 'ev_20261030T100000_aaaaaaaa', title: '汇报进展', at: '2026-10-30T10:00:00+08:00', diary: '我先给了结论，再补两句依据。' },
-    { id: 'ev_20261031T100000_bbbbbbbb', title: '解释概念', at: '2026-10-31T10:00:00+08:00', diary: '这次我铺了三段背景才给结论。' },
-  ]
-  for (const event of events) {
+  const dir = path.join(memoryRoot, 'events')
+  fs.mkdirSync(dir, { recursive: true })
+  for (let i = 0; i < diaryCount; i += 1) {
+    const id = `ev_2026103${i}T1000${String(i).padStart(2, '0')}_${String(i).padStart(8, 'a')}`
     fs.writeFileSync(
-      path.join(memoryRoot, 'events', `${event.id}.json`),
+      path.join(dir, `${id}.json`),
       JSON.stringify({
-        id: event.id,
-        structured: { title: event.title, startedAt: event.at, endedAt: event.at, tags: [], people: [{ name: '我' }], outcome: { status: 'completed' } },
+        id,
+        structured: { title: `事件${i}`, startedAt: `2026-10-3${i}T10:00:00+08:00`, tags: [], people: [], outcome: { status: 'completed' } },
       }),
     )
-    fs.writeFileSync(path.join(memoryRoot, 'events', `${event.id}.md`), `${event.diary}\n`)
+    fs.writeFileSync(path.join(dir, `${id}.md`), `第 ${i} 篇日记正文。\n`)
   }
-  return { agentsFile, memoryRoot, stateRoot: path.join(root, 'state') }
+  return { root, agentsFile, memoryRoot, stateRoot: path.join(root, 'state') }
 }
 
-const ANALYSIS_JSON = JSON.stringify({
+const PAYLOAD = JSON.stringify({
   equilibriumScore: 0.55,
   summary: '我在"先给结论"上不稳定',
-  disequilibrium: [
+  observations: [
     {
       area: 'style',
       observed: '第二篇日记里我先铺了三段背景',
       against: '说话简洁，先给结论',
-      conflict: '图式要求开口即结论，实际行为相反',
+      conflict: '顺序与图式相反',
       severity: 'medium',
-      evidence: [{ eventId: 'ev_20261031T100000_bbbbbbbb', title: '解释概念', quote: '铺了三段背景才给结论' }],
+      evidence: [{ eventId: 'ev_1', title: '事件1', quote: '铺了三段背景' }],
     },
   ],
-  assimilation: [
-    {
-      area: 'style',
-      target: '说话简洁，先给结论',
-      revised: '开口先给结论；需要铺垫时放在结论之后，且不超三句',
-      why: '把"简洁"的边界写清楚',
-      evidence: [],
-    },
+  suggestions: [
+    { id: 's1', area: 'style', op: 'modify', target: '说话简洁，先给结论', value: '开口先给结论；需要背景时放结论之后', piaget: 'assimilation', reason: 'r', evidence: [], confidence: 0.8, severity: 'medium' },
+    { id: 's2', area: 'value', op: 'reorder', order: ['事实 > 面子', '安全 > 进度'], piaget: 'accommodation', reason: 'r', evidence: [], confidence: 0.7, severity: 'medium' },
+    { id: 's3', area: 'belief', op: 'add', value: '结论必须可被数据推翻', piaget: 'accommodation', reason: 'r', evidence: [], confidence: 0.6, severity: 'low' },
   ],
-  accommodation: [
-    { area: 'belief', text: '结论必须能被数据推翻', why: '日记里反复出现验证动作', evidence: [] },
-  ],
-  notes: '样本只有两篇',
+  notes: '样本少',
 })
 
-const fakeClient = (payload = ANALYSIS_JSON): ChatClient => ({
-  chat: async () => payload,
-})
+const fakeClient = (payload = PAYLOAD): ChatClient => ({ chat: async () => payload })
 
-describe('run (dry-run)', () => {
-  it('analyses without touching AGENTS.md', async () => {
-    const ws = makeWorkspace()
-    const config = loadConfig({
-      patch: { agentsFile: ws.agentsFile, memoryRoot: ws.memoryRoot, stateRoot: ws.stateRoot, diaryLimit: 10 },
-    })
-    const beforeText = fs.readFileSync(ws.agentsFile, 'utf8')
-    const result = await run({ config, client: fakeClient(), logger: silentLogger(), dryRun: true })
-
-    expect(result.analysis.equilibriumScore).toBeCloseTo(0.55)
-    expect(result.analysis.disequilibrium).toHaveLength(1)
-    expect(result.applied).toEqual({ assimilation: 1, accommodation: 1 })
-    expect(result.after.style[0]).toContain('且不超三句')
-    expect(result.after.belief).toContain('结论必须能被数据推翻')
-    expect(result.wrote).toBe(false)
-    // 文件未变
-    expect(fs.readFileSync(ws.agentsFile, 'utf8')).toBe(beforeText)
-    expect(listHistory(config)).toHaveLength(0)
+function configure(ws: ReturnType<typeof makeWorkspace>, patch: Record<string, unknown> = {}) {
+  return loadConfig({
+    patch: {
+      agentsFile: ws.agentsFile,
+      memoryRoot: ws.memoryRoot,
+      stateRoot: ws.stateRoot,
+      ...patch,
+    } as never,
   })
-})
+}
 
-describe('run (apply)', () => {
-  it('writes the merged schema and snapshots the previous version', async () => {
+describe('propose 只产出建议，绝不改 AGENTS.md', () => {
+  it('returns suggestions and leaves the file byte-identical', async () => {
     const ws = makeWorkspace()
-    const config = loadConfig({
-      patch: { agentsFile: ws.agentsFile, memoryRoot: ws.memoryRoot, stateRoot: ws.stateRoot },
-    })
-    const result = await run({ config, client: fakeClient(), logger: silentLogger(), dryRun: false })
+    const config = configure(ws)
+    const before = fs.readFileSync(ws.agentsFile, 'utf8')
 
-    expect(result.wrote).toBe(true)
-    expect(result.snapshot).toBeDefined()
-    const written = fs.readFileSync(ws.agentsFile, 'utf8')
-    expect(written).toContain('且不超三句')
-    expect(written).toContain('结论必须能被数据推翻')
-    expect(written).toContain('> **说明：** 风格指怎么做事') // 框架保留
+    const result = await propose({ config, client: fakeClient(), logger: silentLogger() })
 
-    // 快照与历史
-    const history = listHistory(config)
-    expect(history).toHaveLength(1)
-    const snapshotText = fs.readFileSync(history[0]!.file, 'utf8')
-    expect(snapshotText).toBe(AGENTS)
-    // 解析结果与写入一致
-    expect(parseSchemaDoc(written).belief).toContain('结论必须能被数据推翻')
+    expect(result.analysis.suggestions.map((s) => s.op)).toEqual(['modify', 'reorder', 'add'])
+    expect(result.pendingSaved).toBe(true)
+    expect(fs.readFileSync(ws.agentsFile, 'utf8')).toBe(before)
+    expect(listHistory(config)).toHaveLength(0) // 没有写，就没有快照
+    expect(loadPending(config)?.analysis.suggestions).toHaveLength(3)
   })
 
-  it('does not write when nothing is applied', async () => {
+  it('report labels each op and never claims it wrote anything', async () => {
     const ws = makeWorkspace()
-    const config = loadConfig({ patch: { agentsFile: ws.agentsFile, memoryRoot: ws.memoryRoot, stateRoot: ws.stateRoot } })
-    const empty = JSON.stringify({ equilibriumScore: 0.9, summary: '基本自洽', disequilibrium: [], assimilation: [], accommodation: [], notes: '' })
-    const result = await run({ config, client: fakeClient(empty), logger: silentLogger(), dryRun: false })
-    expect(result.wrote).toBe(false)
-    expect(fs.readFileSync(ws.agentsFile, 'utf8')).toBe(AGENTS)
-  })
-})
-
-describe('guards', () => {
-  it('fails clearly when there are no diaries', async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'autoschema-empty-'))
-    const agentsFile = path.join(root, 'AGENTS.md')
-    fs.writeFileSync(agentsFile, AGENTS)
-    const config = loadConfig({ patch: { agentsFile, memoryRoot: path.join(root, 'none'), stateRoot: path.join(root, 's') } })
-    await expect(run({ config, client: fakeClient(), logger: silentLogger() })).rejects.toThrow(/没有可用日记/u)
-  })
-
-  it('gatherDiaries honours limit and reads md bodies', () => {
-    const ws = makeWorkspace()
-    const config = loadConfig({ patch: { agentsFile: ws.agentsFile, memoryRoot: ws.memoryRoot, stateRoot: ws.stateRoot } })
-    const diaries = gatherDiaries(config, 1)
-    expect(diaries).toHaveLength(1)
-    expect(diaries[0]?.title).toBe('解释概念')
-    expect(readDiary(ws.memoryRoot, diaries[0]!.eventId)?.diary).toContain('铺了三段背景')
-  })
-
-  it('report mentions the three stages', async () => {
-    const ws = makeWorkspace()
-    const config = loadConfig({ patch: { agentsFile: ws.agentsFile, memoryRoot: ws.memoryRoot, stateRoot: ws.stateRoot } })
-    const result = await run({ config, client: fakeClient(), logger: silentLogger(), dryRun: true })
+    const config = configure(ws)
+    const result = await propose({ config, client: fakeClient(), logger: silentLogger() })
     const report = renderReport(result)
-    expect(report).toContain('非平衡')
-    expect(report).toContain('同化')
-    expect(report).toContain('顺应')
-    expect(report).toContain('dry-run')
+    expect(report).toContain('改')
+    expect(report).toContain('重排')
+    expect(report).toContain('增')
+    expect(report).toContain('是否采纳由你决定')
+    expect(report).not.toContain('已写回 AGENTS')
   })
 
-  it('snapshotSchema keeps one file per call', () => {
+  it('records the run in the cursor as proposed (not digested)', async () => {
     const ws = makeWorkspace()
-    const config = loadConfig({ patch: { agentsFile: ws.agentsFile, memoryRoot: ws.memoryRoot, stateRoot: ws.stateRoot } })
-    const first = snapshotSchema(config, 'v1')
-    const second = snapshotSchema(config, 'v2')
-    expect(first).not.toBe(second)
-    expect(fs.readFileSync(first, 'utf8')).toBe('v1')
-    expect(listHistory(config)).toHaveLength(2)
-  })
-
-  it('defaultConfig stays inside the state root', () => {
-    const base = defaultConfig()
-    expect(base.agentsFile).toMatch(/AGENTS\.md$/u)
-    expect(base.memoryRoot).toMatch(/\.autobiomemory$/u)
-    expect(base.diaryLimit).toBeGreaterThan(0)
-  })
-})
-
-describe('digest cursor', () => {
-  it('feeds only undigested diaries, and a dry-run proposal parks them as pending', async () => {
-    const ws = makeWorkspace()
-    const config = loadConfig({
-      patch: { agentsFile: ws.agentsFile, memoryRoot: ws.memoryRoot, stateRoot: ws.stateRoot, digest: { onlyUndigested: true, limit: 10, diaryChars: 1000, maxInputChars: 20000 } },
-    })
-    const { loadCursor } = await import('../src/cursor.js')
-    const { loadPending, pendingFile } = await import('../src/reconcile.js')
-
-    const first = await run({ config, client: fakeClient(), logger: silentLogger(), dryRun: true, runId: 'run-1' })
-    expect(first.digestedIds).toHaveLength(2)
-    expect(first.pendingSaved).toBe(true)
+    const config = configure(ws)
+    await propose({ config, client: fakeClient(), logger: silentLogger(), runId: 'run-1' })
     const cursor = loadCursor(ws.stateRoot)
     expect(Object.keys(cursor.proposed)).toHaveLength(2)
     expect(Object.keys(cursor.digested)).toHaveLength(0)
-    expect(fs.existsSync(pendingFile(ws.stateRoot))).toBe(true)
-    expect(loadPending(config)?.runId).toBe('run-1')
+  })
+})
 
-    // 第二次运行：没有新的未消化日记 → 明确报错而不是重复烧 token
-    await expect(run({ config, client: fakeClient(), logger: silentLogger() })).rejects.toThrow(/没有"未消化"的日记/u)
+describe('apply 只采纳被点名的建议', () => {
+  it('applies only the chosen ids', async () => {
+    const ws = makeWorkspace()
+    const config = configure(ws)
+    const result = await propose({ config, client: fakeClient(), logger: silentLogger() })
+    const applied = applySelected(config, result.analysis.suggestions, { ids: ['s1'] })
+
+    expect(applied.changed).toBe(true)
+    expect(applied.applied.modify).toBe(1)
+    expect(applied.applied.reorder).toBe(0)
+    expect(applied.applied.add).toBe(0)
+
+    const written = fs.readFileSync(ws.agentsFile, 'utf8')
+    expect(written).toContain('开口先给结论；需要背景时放结论之后')
+    expect(written).not.toContain('结论必须可被数据推翻')
+    // 价值观顺序未动
+    expect(parseSchemaDoc(written).value).toEqual(['安全 > 进度', '事实 > 面子'])
+    expect(applied.snapshot).toBeDefined()
+    expect(listHistory(config)).toHaveLength(1)
   })
 
-  it('marks diaries digested only after a real write, and consumes the pending proposal', async () => {
+  it('applies everything from pending and marks diaries digested', async () => {
     const ws = makeWorkspace()
-    const config = loadConfig({
-      patch: { agentsFile: ws.agentsFile, memoryRoot: ws.memoryRoot, stateRoot: ws.stateRoot },
-    })
-    const { loadCursor } = await import('../src/cursor.js')
-    const { applyProposal, loadPending } = await import('../src/reconcile.js')
+    const config = configure(ws)
+    await propose({ config, client: fakeClient(), logger: silentLogger(), runId: 'run-1' })
+    const { result } = applyPending(config)
 
-    await run({ config, client: fakeClient(), logger: silentLogger(), dryRun: true, runId: 'run-1' })
-    const proposal = loadPending(config)
-    expect(proposal).toBeDefined()
-
-    const applied = applyProposal(config, proposal!, { runId: 'run-2' })
-    expect(applied.applied).toEqual({ assimilation: 1, accommodation: 1 })
-    expect(applied.snapshot).toBeDefined()
-    expect(fs.readFileSync(ws.agentsFile, 'utf8')).toContain('且不超三句')
+    expect(result.applied).toEqual({ add: 1, remove: 0, modify: 1, reorder: 1 })
+    const written = parseSchemaDoc(fs.readFileSync(ws.agentsFile, 'utf8'))
+    expect(written.value).toEqual(['事实 > 面子', '安全 > 进度']) // reorder 生效
+    expect(written.belief).toContain('结论必须可被数据推翻')
 
     const cursor = loadCursor(ws.stateRoot)
     expect(Object.keys(cursor.digested)).toHaveLength(2)
     expect(Object.keys(cursor.proposed)).toHaveLength(0)
     expect(loadPending(config)).toBeUndefined()
-
-    // 再跑一次：全部已吸收
-    await expect(run({ config, client: fakeClient(), logger: silentLogger() })).rejects.toThrow(/没有"未消化"/u)
   })
 
-  it('allows processing everything with onlyUndigested=false', async () => {
+  it('does nothing when there is no pending proposal', () => {
     const ws = makeWorkspace()
+    const config = configure(ws)
+    expect(() => applyPending(config)).toThrow(/没有待审建议/u)
+  })
+
+  it('clearPending drops the proposal without touching the file', async () => {
+    const ws = makeWorkspace()
+    const config = configure(ws)
+    const before = fs.readFileSync(ws.agentsFile, 'utf8')
+    await propose({ config, client: fakeClient(), logger: silentLogger() })
+    clearPending(config)
+    expect(loadPending(config)).toBeUndefined()
+    expect(fs.readFileSync(ws.agentsFile, 'utf8')).toBe(before)
+  })
+})
+
+describe('日记位置可配置', () => {
+  it('falls back to <memoryRoot>/events when diaries.dirs is empty', () => {
+    const ws = makeWorkspace()
+    const config = configure(ws)
+    expect(resolveDiaryDirs(config)).toEqual([path.join(ws.memoryRoot, 'events')])
+    expect(listEventIds(resolveDiaryDirs(config))).toHaveLength(2)
+  })
+
+  it('reads from explicitly configured directories (multiple, merged)', () => {
+    const ws = makeWorkspace()
+    const second = fs.mkdtempSync(path.join(os.tmpdir(), 'autoschema-alt-'))
+    const id = 'ev_20261101T090000_zzzzzzzz'
+    fs.writeFileSync(
+      path.join(second, `${id}.json`),
+      JSON.stringify({ id, structured: { title: '别处的日记', startedAt: '2026-11-01T09:00:00+08:00', tags: [], people: [], outcome: { status: 'completed' } } }),
+    )
+    fs.writeFileSync(path.join(second, `${id}.md`), '另一处目录里的日记。\n')
+
+    const config = configure(ws, { diaries: { dirs: [path.join(ws.memoryRoot, 'events'), second], strict: true } })
+    expect(resolveDiaryDirs(config)).toHaveLength(2)
+    const diaries = gatherDiaries(config, 10)
+    expect(diaries.map((entry) => entry.title)).toContain('别处的日记')
+    expect(readDiary(resolveDiaryDirs(config), id)?.diary).toContain('另一处目录')
+  })
+
+  it('expands ~ and dedupes configured directories', () => {
     const config = loadConfig({
-      patch: { agentsFile: ws.agentsFile, memoryRoot: ws.memoryRoot, stateRoot: ws.stateRoot, digest: { onlyUndigested: false, limit: 10, diaryChars: 1000, maxInputChars: 20000 } },
+      patch: { diaries: { dirs: ['~/events-a', '~/events-a', '/abs/events-b'] } } as never,
     })
-    await run({ config, client: fakeClient(), logger: silentLogger(), dryRun: true, runId: 'run-1' })
-    const again = await run({ config, client: fakeClient(), logger: silentLogger(), dryRun: true, runId: 'run-2' })
-    expect(again.digestedIds).toHaveLength(2)
-    expect(again.skippedDigested).toBe(0)
+    expect(config.diaries.dirs).toEqual([path.join(os.homedir(), 'events-a'), '/abs/events-b'])
   })
 
-  it('counts undigested diaries and resets on demand', async () => {
+  it('strict mode refuses to fall back', () => {
     const ws = makeWorkspace()
-    const { emptyCursor, countUndigested, markDigested, isSettled, markProposed, pendingEventIds, clearProposed } = await import('../src/cursor.js')
-    let cursor = emptyCursor()
-    expect(countUndigested(cursor, ['a', 'b'])).toBe(2)
-    cursor = markDigested(cursor, ['a'], 'r1')
-    expect(isSettled(cursor, 'a')).toBe(true)
-    expect(countUndigested(cursor, ['a', 'b'])).toBe(1)
-    cursor = markProposed(cursor, ['b'], 'r1')
-    expect(pendingEventIds(cursor)).toEqual(['b'])
-    cursor = clearProposed(cursor)
-    expect(pendingEventIds(cursor)).toEqual([])
-    void ws
+    const config = configure(ws, { diaries: { dirs: [], strict: true } })
+    expect(resolveDiaryDirs(config)).toEqual([])
+  })
+})
+
+describe('游标与守卫', () => {
+  it('skips already-digested diaries and reports why', async () => {
+    const ws = makeWorkspace()
+    const config = configure(ws)
+    const ids = listEventIds(path.join(ws.memoryRoot, 'events'))
+    saveCursor(ws.stateRoot, markDigested(emptyCursor(), ids, 'run-0'))
+    await expect(propose({ config, client: fakeClient(), logger: silentLogger() })).rejects.toThrow(/没有"未消化"/u)
+  })
+
+  it('fails clearly when there are no diaries at all', async () => {
+    const ws = makeWorkspace(0)
+    const config = configure(ws)
+    await expect(propose({ config, client: fakeClient(), logger: silentLogger() })).rejects.toThrow(/没有可用日记/u)
+  })
+
+  it('snapshots are unique and listed', () => {
+    const ws = makeWorkspace()
+    const config = configure(ws)
+    const a = snapshotSchema(config, 'v1')
+    const b = snapshotSchema(config, 'v2')
+    expect(a).not.toBe(b)
+    expect(listHistory(config)).toHaveLength(2)
+  })
+
+  it('readSchema parses the live file', () => {
+    const ws = makeWorkspace()
+    const config = configure(ws)
+    expect(readSchema(config).value).toEqual(['安全 > 进度', '事实 > 面子'])
   })
 })

@@ -13,7 +13,7 @@ export {
 } from './config.js'
 
 export {
-  applyChanges,
+  applySuggestions,
   findClosestIndex,
   itemCount,
   parseSchemaDoc,
@@ -41,11 +41,14 @@ export { gatherDiaries, listHistory, readSchema, renderReport, run, snapshotSche
 export type { RunOptions, RunResult } from './reconcile.js'
 
 export {
-  applyProposal,
+  applyPending,
+  applySelected,
   clearPending,
   loadPending,
   pendingFile,
+  propose,
 } from './reconcile.js'
+export type { ApplySelectionOptions } from './reconcile.js'
 
 export {
   checkDue,
@@ -79,3 +82,5 @@ export { tick, touchRun } from './tick.js'
 export type { TickOptions, TickResult } from './tick.js'
 
 export { createLogger, silentLogger } from './util.js'
+
+export { resolveDiaryDirs } from './diaries.js'

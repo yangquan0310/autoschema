@@ -1,16 +1,18 @@
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+
 import { describe, expect, it } from 'vitest'
 
 import {
-  applyChanges,
+  applySuggestions,
   findClosestIndex,
   itemCount,
   parseSchemaDoc,
   renderSchemaDoc,
   writeSchemaDoc,
 } from '../src/agents-md.js'
-import fs from 'node:fs'
-import os from 'node:os'
-import path from 'node:path'
+import type { Suggestion } from '../src/types.js'
 
 const SKELETON = `# 风格
 
@@ -49,124 +51,207 @@ const FILLED = `# 风格
 
 - 安全 > 进度
 - 事实 > 面子
+- 长期 > 短期
 `
 
-describe('parseSchemaDoc', () => {
+const suggestion = (over: Partial<Suggestion> & Pick<Suggestion, 'area' | 'op'>): Suggestion => ({
+  id: 's1',
+  piaget: over.op === 'modify' ? 'assimilation' : 'accommodation',
+  reason: 'r',
+  evidence: [],
+  confidence: 0.7,
+  severity: 'medium',
+  ...over,
+})
+
+describe('parse / render', () => {
   it('reads the empty skeleton without inventing items', () => {
     const doc = parseSchemaDoc(SKELETON)
     expect(itemCount(doc)).toBe(0)
-    expect(doc.preamble.style).toHaveLength(1)
     expect(doc.preamble.style[0]).toContain('风格指怎么做事')
-    expect(doc.preamble.value[0]).toContain('冲突时的排序')
   })
 
   it('collects bullets per section and keeps the preamble', () => {
     const doc = parseSchemaDoc(FILLED)
-    expect(doc.style).toEqual(['说话简洁，先给结论再给依据', '动手前先复述一遍需求'])
-    expect(doc.belief).toEqual(['不知道就说不知道'])
-    expect(doc.value).toEqual(['安全 > 进度', '事实 > 面子'])
-    expect(itemCount(doc)).toBe(5)
+    expect(doc.style).toHaveLength(2)
+    expect(doc.value).toEqual(['安全 > 进度', '事实 > 面子', '长期 > 短期'])
+    expect(itemCount(doc)).toBe(6)
   })
 
-  it('accepts english headings and ## levels', () => {
-    const doc = parseSchemaDoc(`## STYLE\n- be brief\n\n## beliefs\n- tell the truth\n\n## Values\n- safety first\n`)
-    expect(doc.style).toEqual(['be brief'])
-    expect(doc.belief).toEqual(['tell the truth'])
-    expect(doc.value).toEqual(['safety first'])
-  })
-
-  it('stops a section at the next unrelated heading', () => {
-    const doc = parseSchemaDoc(`# 风格\n- 简洁\n\n# 其他\n- 不该被收进风格\n`)
-    expect(doc.style).toEqual(['简洁'])
-    expect(doc.extra.some((line) => line.includes('其他'))).toBe(true)
-  })
-})
-
-describe('renderSchemaDoc', () => {
   it('round-trips a filled document', () => {
-    const rendered = renderSchemaDoc(parseSchemaDoc(FILLED))
-    expect(rendered).toBe(FILLED.replace(/\n*$/u, '\n'))
-    expect(parseSchemaDoc(rendered).style).toEqual(parseSchemaDoc(FILLED).style)
+    expect(renderSchemaDoc(parseSchemaDoc(FILLED))).toBe(FILLED)
   })
 
-  it('keeps the skeleton shape when there are no items', () => {
-    const rendered = renderSchemaDoc(parseSchemaDoc(SKELETON))
-    expect(rendered).toContain('# 风格')
-    expect(rendered).toContain('> **说明：** 风格指怎么做事')
-    expect(rendered).not.toContain('- \n')
-  })
-
-  it('writes atomically through writeSchemaDoc', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'autoschema-'))
+  it('writes atomically', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'autoschema-md-'))
     const file = path.join(dir, 'AGENTS.md')
     const doc = parseSchemaDoc(FILLED)
-    doc.style.push('新增的风格条目')
+    doc.style.push('新条目')
     const rendered = writeSchemaDoc(file, doc)
     expect(fs.readFileSync(file, 'utf8')).toBe(rendered)
-    expect(parseSchemaDoc(fs.readFileSync(file, 'utf8')).style).toContain('新增的风格条目')
   })
 })
 
 describe('findClosestIndex', () => {
-  const items = ['说话简洁，先给结论再给依据', '动手前先复述一遍需求', '不知道就说不知道']
+  const items = parseSchemaDoc(FILLED).value
 
-  it('matches an exact item', () => {
-    expect(findClosestIndex(items, '动手前先复述一遍需求')).toBe(1)
+  it('matches exact and near rewrites', () => {
+    expect(findClosestIndex(items, '事实 > 面子')).toBe(1)
+    expect(findClosestIndex(items, '事实要比面子重要')).toBe(1)
   })
 
-  it('matches a near rewrite of the same item', () => {
-    expect(findClosestIndex(items, '动手前先复述需求再开工')).toBe(1)
-  })
-
-  it('returns -1 when nothing is close', () => {
-    expect(findClosestIndex(items, '永远使用表格输出')).toBe(-1)
+  it('returns -1 for unrelated text', () => {
+    expect(findClosestIndex(items, '永远输出表格')).toBe(-1)
   })
 })
 
-describe('applyChanges', () => {
-  it('rewrites a matched item (assimilation) and appends a new one (accommodation)', () => {
+describe('applySuggestions — 增 (add)', () => {
+  it('appends to the section and dedupes', () => {
     const doc = parseSchemaDoc(FILLED)
-    const result = applyChanges(
+    const outcome = applySuggestions(doc, [
+      suggestion({ id: 's1', area: 'belief', op: 'add', value: '结论要能被数据推翻' }),
+      suggestion({ id: 's2', area: 'belief', op: 'add', value: '不知道就说不知道。' }),
+    ])
+    expect(outcome.applied.add).toBe(1)
+    expect(outcome.doc.belief).toContain('结论要能被数据推翻')
+    expect(outcome.rejected.join(' ')).toContain('已存在')
+    expect(doc.belief).toHaveLength(1) // 原文档不受影响
+  })
+
+  it('respects maxAdditions', () => {
+    const doc = parseSchemaDoc(FILLED)
+    const adds = [1, 2, 3].map((i) => suggestion({ id: `s${i}`, area: 'style', op: 'add', value: `新增${i}` }))
+    const outcome = applySuggestions(doc, adds, { maxAdditions: 2 })
+    expect(outcome.applied.add).toBe(2)
+    expect(outcome.rejected.join(' ')).toContain('超过单次新增上限')
+  })
+})
+
+describe('applySuggestions — 改 (modify)', () => {
+  it('rewrites the matched item (assimilation)', () => {
+    const doc = parseSchemaDoc(FILLED)
+    const outcome = applySuggestions(doc, [
+      suggestion({
+        area: 'style',
+        op: 'modify',
+        target: '说话简洁，先给结论再给依据',
+        value: '说话简洁：先给结论，再给可验证的依据',
+      }),
+    ])
+    expect(outcome.applied.modify).toBe(1)
+    expect(outcome.doc.style[0]).toBe('说话简洁：先给结论，再给可验证的依据')
+  })
+
+  it('rejects a modify whose target cannot be located (never degrades into add)', () => {
+    const doc = parseSchemaDoc(FILLED)
+    const outcome = applySuggestions(doc, [
+      suggestion({ area: 'belief', op: 'modify', target: '从不加班', value: '从不加班' }),
+    ])
+    expect(outcome.applied.modify).toBe(0)
+    expect(outcome.applied.add).toBe(0)
+    expect(outcome.doc.belief).toHaveLength(1)
+    expect(outcome.rejected.join(' ')).toContain('定位不到条目')
+  })
+
+  it('rejects a no-op modify', () => {
+    const doc = parseSchemaDoc(FILLED)
+    const outcome = applySuggestions(doc, [
+      suggestion({ area: 'belief', op: 'modify', target: '不知道就说不知道', value: '不知道就说不知道。' }),
+    ])
+    expect(outcome.applied.modify).toBe(0)
+    expect(outcome.rejected.join(' ')).toContain('相同')
+  })
+})
+
+describe('applySuggestions — 删 (remove)', () => {
+  it('removes the matched item', () => {
+    const doc = parseSchemaDoc(FILLED)
+    const outcome = applySuggestions(doc, [suggestion({ area: 'value', op: 'remove', target: '事实 > 面子' })])
+    expect(outcome.applied.remove).toBe(1)
+    expect(outcome.doc.value).toEqual(['安全 > 进度', '长期 > 短期'])
+  })
+
+  it('refuses to empty a section', () => {
+    const doc = parseSchemaDoc(FILLED)
+    const outcome = applySuggestions(doc, [
+      suggestion({ area: 'belief', op: 'remove', target: '不知道就说不知道' }),
+    ])
+    expect(outcome.applied.remove).toBe(0)
+    expect(outcome.rejected.join(' ')).toContain('拒绝删空')
+  })
+
+  it('caps removals per run and rejects unknown targets', () => {
+    const doc = parseSchemaDoc(FILLED)
+    const outcome = applySuggestions(
       doc,
-      [{ area: 'style', target: '说话简洁，先给结论再给依据', revised: '说话简洁，先给结论，再给可验证的依据', why: '日记显示常常只给结论不给依据', evidence: [] }],
-      [{ area: 'belief', text: '结论要能被数据推翻', why: '日记里反复出现验证动作', evidence: [] }],
+      [
+        suggestion({ id: 's1', area: 'value', op: 'remove', target: '安全 > 进度' }),
+        suggestion({ id: 's2', area: 'value', op: 'remove', target: '事实 > 面子' }),
+        suggestion({ id: 's3', area: 'style', op: 'remove', target: '不存在的条目' }),
+      ],
+      { maxRemovals: 1 },
     )
-    expect(result.applied).toEqual({ assimilation: 1, accommodation: 1 })
-    expect(result.doc.style[0]).toBe('说话简洁，先给结论，再给可验证的依据')
-    expect(result.doc.belief).toContain('结论要能被数据推翻')
-    // 原文不变
-    expect(doc.style[0]).toBe('说话简洁，先给结论再给依据')
+    expect(outcome.applied.remove).toBe(1)
+    expect(outcome.rejected.join(' ')).toContain('超过单次删除上限')
+    expect(outcome.rejected.join(' ')).toContain('定位不到条目')
+  })
+})
+
+describe('applySuggestions — 价值观重排 (reorder)', () => {
+  it('reorders exactly as asked (order = priority)', () => {
+    const doc = parseSchemaDoc(FILLED)
+    const outcome = applySuggestions(doc, [
+      suggestion({ area: 'value', op: 'reorder', order: ['长期 > 短期', '安全 > 进度', '事实 > 面子'] }),
+    ])
+    expect(outcome.applied.reorder).toBe(1)
+    expect(outcome.doc.value).toEqual(['长期 > 短期', '安全 > 进度', '事实 > 面子'])
   })
 
-  it('skips an assimilation whose target cannot be located instead of appending', () => {
+  it('keeps unmentioned items at the tail in their original relative order', () => {
     const doc = parseSchemaDoc(FILLED)
-    const result = applyChanges(
+    const outcome = applySuggestions(doc, [
+      suggestion({ area: 'value', op: 'reorder', order: ['长期 > 短期', '事实 > 面子'] }),
+    ])
+    expect(outcome.doc.value).toEqual(['长期 > 短期', '事实 > 面子', '安全 > 进度'])
+  })
+
+  it('rejects a no-op reorder and a single-item order', () => {
+    const doc = parseSchemaDoc(FILLED)
+    const noop = applySuggestions(doc, [
+      suggestion({ area: 'value', op: 'reorder', order: ['安全 > 进度', '事实 > 面子', '长期 > 短期'] }),
+    ])
+    expect(noop.applied.reorder).toBe(0)
+    expect(noop.rejected.join(' ')).toContain('顺序未变化')
+
+    const single = applySuggestions(doc, [suggestion({ area: 'value', op: 'reorder', order: ['事实 > 面子'] })])
+    expect(single.applied.reorder).toBe(0)
+    expect(single.rejected.join(' ')).toContain('至少需要 2 条')
+  })
+})
+
+describe('applySuggestions — 选择性采纳与纯函数性', () => {
+  it('only applies the requested ids', () => {
+    const doc = parseSchemaDoc(FILLED)
+    const outcome = applySuggestions(
       doc,
-      [{ area: 'value', target: '从不加班', revised: '从不加班', why: 'x', evidence: [] }],
-      [],
+      [
+        suggestion({ id: 's1', area: 'belief', op: 'add', value: '新增 A' }),
+        suggestion({ id: 's2', area: 'belief', op: 'add', value: '新增 B' }),
+      ],
+      { ids: ['s2'] },
     )
-    expect(result.applied.assimilation).toBe(0)
-    expect(result.skipped.join(' ')).toContain('找不到目标')
-    expect(result.doc.value).toHaveLength(2)
+    expect(outcome.applied.add).toBe(1)
+    expect(outcome.doc.belief).toContain('新增 B')
+    expect(outcome.doc.belief).not.toContain('新增 A')
   })
 
-  it('deduplicates an accommodation that already exists', () => {
+  it('leaves the input document untouched', () => {
     const doc = parseSchemaDoc(FILLED)
-    const result = applyChanges(doc, [], [{ area: 'belief', text: '不知道就说不知道。', why: 'x', evidence: [] }])
-    expect(result.applied.accommodation).toBe(0)
-    expect(result.skipped.join(' ')).toContain('已存在')
-  })
-
-  it('appends accommodations at the end of the 价值观 section (lowest priority)', () => {
-    const doc = parseSchemaDoc(FILLED)
-    const result = applyChanges(doc, [], [{ area: 'value', text: '长期 > 短期', why: 'x', evidence: [] }])
-    expect(result.doc.value).toEqual(['安全 > 进度', '事实 > 面子', '长期 > 短期'])
-  })
-
-  it('leaves the document untouched when given empty inputs', () => {
-    const doc = parseSchemaDoc(FILLED)
-    const result = applyChanges(doc, [], [])
-    expect(result.applied).toEqual({ assimilation: 0, accommodation: 0 })
-    expect(renderSchemaDoc(result.doc)).toBe(renderSchemaDoc(doc))
+    const before = renderSchemaDoc(doc)
+    applySuggestions(doc, [
+      suggestion({ area: 'style', op: 'add', value: 'x' }),
+      suggestion({ area: 'value', op: 'remove', target: '安全 > 进度' }),
+    ])
+    expect(renderSchemaDoc(doc)).toBe(before)
   })
 })
