@@ -19,6 +19,8 @@ node dist/cli.js analyze --verbose
 | `feat/agents-md` | 三节解析、渲染、同化/顺应合并 |
 | `feat/analysis` | 日记读取、皮亚杰指导语、响应解析、DeepSeek 客户端 |
 | `feat/reconcile` | 编排、快照、报告、CLI |
+| `feat/cursor` | 消化游标（digested / proposed）、pending 建议复用 |
+| `feat/trigger` | 定时（tick/daemon/cron）与 hook（特定生命周期点）触发 |
 | `alpha` | 集成分支：合并 feat，跑全量测试 |
 | `beta` | 打包分支：`pnpm run check && pnpm run pack:dist` |
 
