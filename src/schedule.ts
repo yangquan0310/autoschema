@@ -40,11 +40,16 @@ export function nextAtTime(now: Date, atTime: string): number | undefined {
  * 闸门顺序：模式允许 → 冷却 → 最小新日记数 → 固定时刻（若配置）。
  */
 export function checkDue(config: AutoSchemaConfig, now = new Date()): DueCheck {
-  if (!config.trigger.modes.includes('schedule')) {
-    return { due: false, reason: 'trigger.modes 未启用 schedule', waitMs: Number.POSITIVE_INFINITY, undigested: 0 }
-  }
   const cursor = loadCursor(config.stateRoot)
   const undigested = countUndigested(cursor, listEventIds(config.memoryRoot))
+  if (!config.trigger.modes.includes('schedule')) {
+    return {
+      due: false,
+      reason: 'trigger.modes 未启用 schedule',
+      waitMs: Number.POSITIVE_INFINITY,
+      undigested,
+    }
+  }
 
   if (undigested < config.trigger.minNewDiaries) {
     return {
@@ -114,11 +119,16 @@ export function checkHookDue(config: AutoSchemaConfig, now = new Date()): DueChe
     return { due: false, reason: 'trigger.modes 未启用 hook', waitMs: Number.POSITIVE_INFINITY, undigested: 0 }
   }
   const events = config.trigger.hook.events
-  if (events.length === 0) {
-    return { due: false, reason: 'trigger.hook.events 为空（未选择挂点）', waitMs: Number.POSITIVE_INFINITY, undigested: 0 }
-  }
   const cursor = loadCursor(config.stateRoot)
   const undigested = countUndigested(cursor, listEventIds(config.memoryRoot))
+  if (events.length === 0) {
+    return {
+      due: false,
+      reason: 'trigger.hook.events 为空（未选择挂点）',
+      waitMs: Number.POSITIVE_INFINITY,
+      undigested,
+    }
+  }
   if (undigested < config.trigger.minNewDiaries) {
     return {
       due: false,
@@ -159,8 +169,14 @@ export function cronLine(config: AutoSchemaConfig, cliPath = 'autoschema'): stri
     const [h, m] = config.trigger.schedule.atTime.split(':') as [string, string]
     return `${Number(m)} ${Number(h)} * * * ${cliPath} tick --state ${config.stateRoot} >> ${config.stateRoot}/logs/tick.log 2>&1`
   }
-  if (minutes % 60 === 0) {
-    return `0 */${Math.max(1, minutes / 60)} * * * ${cliPath} tick --state ${config.stateRoot} >> ${config.stateRoot}/logs/tick.log 2>&1`
+  const tail = `${cliPath} tick --state ${config.stateRoot} >> ${config.stateRoot}/logs/tick.log 2>&1`
+  if (minutes >= 1_440) {
+    // 每天一次：cron 的小时字段上限 23，不能用 */24
+    const days = Math.max(1, Math.round(minutes / 1_440))
+    return days === 1 ? `0 3 * * * ${tail}` : `0 3 */${days} * * ${tail}`
   }
-  return `*/${minutes} * * * * ${cliPath} tick --state ${config.stateRoot} >> ${config.stateRoot}/logs/tick.log 2>&1`
+  if (minutes % 60 === 0) {
+    return `0 */${Math.max(1, minutes / 60)} * * * ${tail}`
+  }
+  return `*/${Math.max(1, minutes)} * * * * ${tail}`
 }

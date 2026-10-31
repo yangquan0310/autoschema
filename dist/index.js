@@ -8,7 +8,7 @@ var SECTION_LABELS = {
 // src/constants.ts
 import os from "os";
 import path from "path";
-var VERSION = "0.2.0";
+var VERSION = "0.2.1";
 var DEFAULT_AGENTS_FILE = path.join(os.homedir(), ".dsh", "AGENTS.md");
 var DEFAULT_MEMORY_ROOT = path.join(os.homedir(), ".autobiomemory");
 var DEFAULT_STATE_ROOT = path.join(os.homedir(), ".autoschema");
@@ -1086,11 +1086,16 @@ function nextAtTime(now, atTime) {
   return target.getTime();
 }
 function checkDue(config, now = /* @__PURE__ */ new Date()) {
-  if (!config.trigger.modes.includes("schedule")) {
-    return { due: false, reason: "trigger.modes \u672A\u542F\u7528 schedule", waitMs: Number.POSITIVE_INFINITY, undigested: 0 };
-  }
   const cursor = loadCursor(config.stateRoot);
   const undigested = countUndigested(cursor, listEventIds(config.memoryRoot));
+  if (!config.trigger.modes.includes("schedule")) {
+    return {
+      due: false,
+      reason: "trigger.modes \u672A\u542F\u7528 schedule",
+      waitMs: Number.POSITIVE_INFINITY,
+      undigested
+    };
+  }
   if (undigested < config.trigger.minNewDiaries) {
     return {
       due: false,
@@ -1148,11 +1153,16 @@ function checkHookDue(config, now = /* @__PURE__ */ new Date()) {
     return { due: false, reason: "trigger.modes \u672A\u542F\u7528 hook", waitMs: Number.POSITIVE_INFINITY, undigested: 0 };
   }
   const events = config.trigger.hook.events;
-  if (events.length === 0) {
-    return { due: false, reason: "trigger.hook.events \u4E3A\u7A7A\uFF08\u672A\u9009\u62E9\u6302\u70B9\uFF09", waitMs: Number.POSITIVE_INFINITY, undigested: 0 };
-  }
   const cursor = loadCursor(config.stateRoot);
   const undigested = countUndigested(cursor, listEventIds(config.memoryRoot));
+  if (events.length === 0) {
+    return {
+      due: false,
+      reason: "trigger.hook.events \u4E3A\u7A7A\uFF08\u672A\u9009\u62E9\u6302\u70B9\uFF09",
+      waitMs: Number.POSITIVE_INFINITY,
+      undigested
+    };
+  }
   if (undigested < config.trigger.minNewDiaries) {
     return {
       due: false,
@@ -1189,10 +1199,15 @@ function cronLine(config, cliPath = "autoschema") {
     const [h, m] = config.trigger.schedule.atTime.split(":");
     return `${Number(m)} ${Number(h)} * * * ${cliPath} tick --state ${config.stateRoot} >> ${config.stateRoot}/logs/tick.log 2>&1`;
   }
-  if (minutes % 60 === 0) {
-    return `0 */${Math.max(1, minutes / 60)} * * * ${cliPath} tick --state ${config.stateRoot} >> ${config.stateRoot}/logs/tick.log 2>&1`;
+  const tail = `${cliPath} tick --state ${config.stateRoot} >> ${config.stateRoot}/logs/tick.log 2>&1`;
+  if (minutes >= 1440) {
+    const days = Math.max(1, Math.round(minutes / 1440));
+    return days === 1 ? `0 3 * * * ${tail}` : `0 3 */${days} * * ${tail}`;
   }
-  return `*/${minutes} * * * * ${cliPath} tick --state ${config.stateRoot} >> ${config.stateRoot}/logs/tick.log 2>&1`;
+  if (minutes % 60 === 0) {
+    return `0 */${Math.max(1, minutes / 60)} * * * ${tail}`;
+  }
+  return `*/${Math.max(1, minutes)} * * * * ${tail}`;
 }
 
 // src/tick.ts

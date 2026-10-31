@@ -1082,11 +1082,16 @@ function nextAtTime(now, atTime) {
   return target.getTime();
 }
 function checkDue(config, now = /* @__PURE__ */ new Date()) {
-  if (!config.trigger.modes.includes("schedule")) {
-    return { due: false, reason: "trigger.modes \u672A\u542F\u7528 schedule", waitMs: Number.POSITIVE_INFINITY, undigested: 0 };
-  }
   const cursor = loadCursor(config.stateRoot);
   const undigested = countUndigested(cursor, listEventIds(config.memoryRoot));
+  if (!config.trigger.modes.includes("schedule")) {
+    return {
+      due: false,
+      reason: "trigger.modes \u672A\u542F\u7528 schedule",
+      waitMs: Number.POSITIVE_INFINITY,
+      undigested
+    };
+  }
   if (undigested < config.trigger.minNewDiaries) {
     return {
       due: false,
@@ -1144,11 +1149,16 @@ function checkHookDue(config, now = /* @__PURE__ */ new Date()) {
     return { due: false, reason: "trigger.modes \u672A\u542F\u7528 hook", waitMs: Number.POSITIVE_INFINITY, undigested: 0 };
   }
   const events = config.trigger.hook.events;
-  if (events.length === 0) {
-    return { due: false, reason: "trigger.hook.events \u4E3A\u7A7A\uFF08\u672A\u9009\u62E9\u6302\u70B9\uFF09", waitMs: Number.POSITIVE_INFINITY, undigested: 0 };
-  }
   const cursor = loadCursor(config.stateRoot);
   const undigested = countUndigested(cursor, listEventIds(config.memoryRoot));
+  if (events.length === 0) {
+    return {
+      due: false,
+      reason: "trigger.hook.events \u4E3A\u7A7A\uFF08\u672A\u9009\u62E9\u6302\u70B9\uFF09",
+      waitMs: Number.POSITIVE_INFINITY,
+      undigested
+    };
+  }
   if (undigested < config.trigger.minNewDiaries) {
     return {
       due: false,
@@ -1185,10 +1195,15 @@ function cronLine(config, cliPath = "autoschema") {
     const [h, m] = config.trigger.schedule.atTime.split(":");
     return `${Number(m)} ${Number(h)} * * * ${cliPath} tick --state ${config.stateRoot} >> ${config.stateRoot}/logs/tick.log 2>&1`;
   }
-  if (minutes % 60 === 0) {
-    return `0 */${Math.max(1, minutes / 60)} * * * ${cliPath} tick --state ${config.stateRoot} >> ${config.stateRoot}/logs/tick.log 2>&1`;
+  const tail = `${cliPath} tick --state ${config.stateRoot} >> ${config.stateRoot}/logs/tick.log 2>&1`;
+  if (minutes >= 1440) {
+    const days = Math.max(1, Math.round(minutes / 1440));
+    return days === 1 ? `0 3 * * * ${tail}` : `0 3 */${days} * * ${tail}`;
   }
-  return `*/${minutes} * * * * ${cliPath} tick --state ${config.stateRoot} >> ${config.stateRoot}/logs/tick.log 2>&1`;
+  if (minutes % 60 === 0) {
+    return `0 */${Math.max(1, minutes / 60)} * * * ${tail}`;
+  }
+  return `*/${Math.max(1, minutes)} * * * * ${tail}`;
 }
 
 // src/tick.ts
@@ -1262,7 +1277,7 @@ var num = (args, key) => {
 };
 var bool = (args, key) => args.flags.has(key);
 function help() {
-  process.stdout.write(`AutoSchema 0.2.0 \u2014 \u8BA9\u81EA\u6211\u56FE\u5F0F\u968F\u65E5\u8BB0\u6F14\u5316\uFF08\u76AE\u4E9A\u6770\uFF1A\u975E\u5E73\u8861 \u2192 \u540C\u5316/\u987A\u5E94 \u2192 \u5E73\u8861\uFF09
+  process.stdout.write(`AutoSchema 0.2.1 \u2014 \u8BA9\u81EA\u6211\u56FE\u5F0F\u968F\u65E5\u8BB0\u6F14\u5316\uFF08\u76AE\u4E9A\u6770\uFF1A\u975E\u5E73\u8861 \u2192 \u540C\u5316/\u987A\u5E94 \u2192 \u5E73\u8861\uFF09
 
 \u7528\u6CD5\uFF1Aautoschema <command> [options]
 
@@ -1295,7 +1310,7 @@ async function main() {
     return 0;
   }
   if (args.command === "--version" || args.command === "version") {
-    process.stdout.write("AutoSchema 0.2.0\n");
+    process.stdout.write("AutoSchema 0.2.1\n");
     return 0;
   }
   const config = loadConfig({

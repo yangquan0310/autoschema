@@ -3,7 +3,7 @@
 import os from 'node:os'
 import path from 'node:path'
 
-export const VERSION = '0.2.0'
+export const VERSION = '0.2.1'
 
 export const DEFAULT_AGENTS_FILE = path.join(os.homedir(), '.dsh', 'AGENTS.md')
 export const DEFAULT_MEMORY_ROOT = path.join(os.homedir(), '.autobiomemory')

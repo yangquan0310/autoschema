@@ -112,6 +112,22 @@ describe('checkDue', () => {
     expect(nextAtTime(now, '25:00')).toBeUndefined()
   })
 
+  it('reports the real undigested count even when schedule is off', () => {
+    const ws = workspace(4)
+    const config = configure(ws, { modes: ['manual'] })
+    expect(checkDue(config).undigested).toBe(4)
+  })
+
+  it('never emits an out-of-range hour field for daily intervals', () => {
+    const ws = workspace()
+    const daily = configure(ws, { modes: ['schedule'], cooldownMs: 0, minNewDiaries: 1, applyMode: 'propose', schedule: { intervalMinutes: 1440, skipIfOverdueMinutes: 0 }, hook: { events: [], cooldownMs: 0 } })
+    const line = cronLine(daily)
+    expect(line).toMatch(/^0 3 \* \* \* autoschema tick/u)
+    expect(line).not.toMatch(/\*\/24/u)
+    const every2Days = configure(ws, { modes: ['schedule'], cooldownMs: 0, minNewDiaries: 1, applyMode: 'propose', schedule: { intervalMinutes: 2880, skipIfOverdueMinutes: 0 }, hook: { events: [], cooldownMs: 0 } })
+    expect(cronLine(every2Days)).toMatch(/^0 3 \*\/2 \* \* autoschema tick/u)
+  })
+
   it('renders a usable crontab line', () => {
     const ws = workspace()
     const hourly = configure(ws, { modes: ['schedule'], cooldownMs: 0, minNewDiaries: 1, applyMode: 'propose', schedule: { intervalMinutes: 60, skipIfOverdueMinutes: 0 }, hook: { events: [], cooldownMs: 0 } })

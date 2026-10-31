@@ -63,7 +63,7 @@ const num = (args: Args, key: string): number | undefined => {
 const bool = (args: Args, key: string): boolean => args.flags.has(key)
 
 function help(): void {
-  process.stdout.write(`AutoSchema 0.2.0 — 让自我图式随日记演化（皮亚杰：非平衡 → 同化/顺应 → 平衡）
+  process.stdout.write(`AutoSchema 0.2.1 — 让自我图式随日记演化（皮亚杰：非平衡 → 同化/顺应 → 平衡）
 
 用法：autoschema <command> [options]
 
@@ -98,7 +98,7 @@ async function main(): Promise<number> {
     return 0
   }
   if (args.command === '--version' || args.command === 'version') {
-    process.stdout.write('AutoSchema 0.2.0\n')
+    process.stdout.write('AutoSchema 0.2.1\n')
     return 0
   }
 
