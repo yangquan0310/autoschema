@@ -65,26 +65,90 @@ AutoBioMemory 负责"记住我做过什么"，AutoSchema 负责"据此更新我�
 }
 ```
 
-## 安装与使用
+## 安装
+
+三种方式，按需要选一种。**AutoSchema 不改 `AGENTS.md`**，所以装完不会动你的文件。
+
+### A. 用 Release 资产（最省事，无需 clone / 编译）
+
+每个版本都发布预构建产物：
+
+```bash
+VER=0.3.1
+curl -L -o autoschema.tgz \
+  "https://github.com/yangquan0310/autoschema/releases/download/v$VER/autoschema-$VER.tgz"
+mkdir -p ~/opt/autoschema && tar -xzf autoschema.tgz -C ~/opt/autoschema --strip-components=1
+
+node ~/opt/autoschema/cli.js doctor      # 自检
+node ~/opt/autoschema/cli.js propose     # 出建议（只读）
+```
+
+想直接敲 `autoschema` 而不是 `node …/cli.js`：
+
+```bash
+cd ~/opt/autoschema && npm i -g .        # 或 pnpm add -g .
+autoschema doctor
+```
+
+### B. 从 git 安装（hook 触发必须这样装）
+
+只有装进 dsh profile，`trigger.modes` 里的 `hook` 才会挂上生命周期点：
+
+```bash
+dsh plugin --profile web add "git+https://github.com/yangquan0310/autoschema.git#main"
+```
+
+仓库已跟踪 `dist/`，**装的时候不需要编译**。装完重启 profile 进程，然后：
+
+```bash
+# 用 profile 里的那份跑（或全局装一份，两者共享 ~/.autoschema 状态）
+node ~/.dsh/profiles/web/node_modules/autoschema/dist/cli.js doctor
+```
+
+hook 挂点与冷却在 `~/.autoschema/config.json` 里配：
+
+```jsonc
+"trigger": {
+  "modes": ["manual", "hook"],
+  "hook": { "events": ["compaction/start"], "cooldownMs": 1800000 }
+}
+```
+
+### C. 从源码（开发用）
 
 ```bash
 git clone https://github.com/yangquan0310/autoschema.git && cd autoschema
-pnpm install && pnpm run build
-node dist/cli.js doctor          # 自检：目录 / 密钥 / 日记篇数 / DeepSeek 连通性
-node dist/cli.js propose         # 出建议（不改任何文件）
-node dist/cli.js pending         # 看待审建议摘要
-node dist/cli.js apply --ids s1  # 采纳第 1 条（写前快照）
+pnpm install && pnpm run check      # typecheck + 64 个测试 + build
+node dist/cli.js doctor
 ```
 
-日记位置在 `config.json` 里配（支持多个目录）：
+## 日常使用
+
+```bash
+autoschema doctor                  # 自检：日记目录 / 密钥 / 篇数 / DeepSeek 连通性
+autoschema propose                 # 出建议（默认只读，不改任何文件）
+autoschema pending                 # 看待审建议摘要（增/删/改/重排 各几条）
+autoschema apply --ids s1,s3       # 只采纳这两条（写前自动快照到 ~/.autoschema/history/）
+autoschema apply                   # 全部采纳
+autoschema show                    # 打印当前解析出的图式
+autoschema history                 # 历次快照，可回滚
+```
+
+> `propose` 与所有自动触发（`tick` / `daemon` / hook）**只产出建议**；
+> 是否采纳、采纳哪几条，由 agent 或人决定。
+
+## 日记位置（可配置）
 
 ```jsonc
+// ~/.autoschema/config.json
 "diaries": {
-  "dirs": ["~/.autobiomemory/events", "/data/another-memory/events"],
+  "dirs": ["~/.autobiomemory/events", "/data/another-memory/events"],  // 多目录、支持 ~、去重
   "includeGlobs": ["*.json"],
-  "strict": false        // true = 不回落到 memoryRoot/events
+  "strict": false        // true = 只读上面这些目录，不回落到 memoryRoot/events
 }
 ```
+
+CLI 也可临时覆盖：`autoschema propose --diaries /a/events,/b/events`。
 
 ## 什么时候跑（触发方式）
 

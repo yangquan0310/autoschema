@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.3.1] — 2026-10-31
+
+### Docs
+
+- README 补齐三条安装路径：**Release 资产**（免 clone/编译）· **`dsh plugin add git+…`**（hook 触发必须这样装，
+  仓库已跟踪 `dist/`，装时无需构建）· **源码**（`pnpm run check`）。
+- 补充 `npm i -g .` 得到全局 `autoschema` 命令的用法。
+- 讲清 `propose`/自动触发“只出建议、不写文件”，采纳要走 `apply --ids`。
+- `diaries.dirs` 多目录配置与 `--diaries` 覆盖写进安装段。
+
 ## [0.3.0] — 2026-10-31
 
 ### Breaking — 插件只产出建议，绝不改 AGENTS.md
