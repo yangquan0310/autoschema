@@ -26,7 +26,7 @@ const copy = (name) => {
 for (const entry of fs.readdirSync(distDir)) {
   if (/^(index|cli|chunk-[\w-]+)\.(js|d\.ts)$/u.test(entry)) copy(entry)
 }
-for (const entry of ['README.md', 'LICENSE']) {
+for (const entry of ['README.md', 'LICENSE', 'cordis.patch.yml']) {
   const src = path.join(repo, entry)
   if (fs.existsSync(src)) fs.cpSync(src, path.join(pkgDir, entry))
 }
@@ -42,7 +42,18 @@ fs.writeFileSync(
       types: 'index.d.ts',
       exports: { '.': { types: './index.d.ts', default: './index.js' }, './cli': { types: './cli.d.ts', default: './cli.js' } },
       bin: { autoschema: './cli.js' },
-      files: ['index.js', 'index.d.ts', 'cli.js', 'cli.d.ts', 'chunk-*.js', 'README.md', 'LICENSE'],
+      files: [
+        'index.js',
+        'index.d.ts',
+        'cli.js',
+        'cli.d.ts',
+        'chunk-*.js',
+        'cordis.patch.yml',
+        'README.md',
+        'LICENSE',
+      ],
+      // 没有这一段，dsh plugin add 只会当普通依赖装，注册不成 bundle 层（hook 挂不上）
+      dsh: { bundle: { patch: './cordis.patch.yml' } },
       license: rootPkg.license,
       engines: rootPkg.engines,
     },

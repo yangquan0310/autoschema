@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.2] — 2026-10-31
+
+### Fixed（打包）
+
+- **Release 资产丢了 `dsh.bundle`**：`scripts/pack-dist.mjs` 生成的 package.json 没有
+  `dsh.bundle.patch`，也没把 `cordis.patch.yml` 打进包里，导致 `dsh plugin add <tgz>` 只当普通依赖安装、
+  提示 `declares no dsh.bundle`、**注册不成 profile 层**（hook 因此永远挂不上）。
+  现在两者都补上，并已用临时 profile 实测 `dsh.profile.bundles` 里出现 `autoschema`。
+
+> 说明：`trigger.modes` 默认仍是 `["manual"]`，自动触发需你显式打开。
+
 ## [0.3.1] — 2026-10-31
 
 ### Docs
