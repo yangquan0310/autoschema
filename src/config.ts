@@ -24,6 +24,8 @@ export function defaultConfig(): AutoSchemaConfig {
       cooldownMs: 3_600_000,
       minNewDiaries: 5,
       applyMode: 'propose',
+      maxRemovals: 2,
+      maxAdditions: 4,
       schedule: { intervalMinutes: 1_440, skipIfOverdueMinutes: 720 },
       hook: { events: ['compaction/start'], cooldownMs: 1_800_000 },
     },
@@ -102,6 +104,8 @@ export function loadConfig(options: { stateRoot?: string; patch?: DeepPartial<Au
   merged.trigger.cooldownMs = Math.max(0, merged.trigger.cooldownMs)
   merged.trigger.hook.cooldownMs = Math.max(0, merged.trigger.hook.cooldownMs)
   merged.trigger.minNewDiaries = Math.max(1, Math.round(merged.trigger.minNewDiaries))
+  merged.trigger.maxRemovals = Math.max(0, Math.round(merged.trigger.maxRemovals ?? 2))
+  merged.trigger.maxAdditions = Math.max(1, Math.round(merged.trigger.maxAdditions ?? 4))
   merged.trigger.schedule.intervalMinutes = Math.max(1, Math.round(merged.trigger.schedule.intervalMinutes))
   merged.agentsFile = path.resolve(merged.agentsFile)
   merged.memoryRoot = path.resolve(merged.memoryRoot)
@@ -139,6 +143,9 @@ export function validateConfig(config: AutoSchemaConfig): string[] {
   }
   if (config.trigger.applyMode !== 'propose' && config.trigger.applyMode !== 'apply') {
     problems.push("trigger.applyMode 只能是 propose 或 apply")
+  }
+  if (typeof config.trigger.maxRemovals === 'number' && config.trigger.maxRemovals < 0) {
+    problems.push('trigger.maxRemovals 不能为负')
   }
   return problems
 }

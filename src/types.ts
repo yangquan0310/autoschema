@@ -73,10 +73,25 @@ export interface AssimilationItem {
   evidence: Evidence[]
 }
 
-/** 一条顺应：新增要点。 */
+/**
+ * 顺应（accommodation）的三种操作形态：图式**结构**的变化。
+ *
+ * - `add`：新增要点（原来那种）
+ * - `remove`：删除要点——它同样是顺应，因为图式的条目集合变了
+ * - `reorder`：调整顺序——`价值观` 的本质就是排序，不重排等于没更新
+ */
+export type AccommodationOp = 'add' | 'remove' | 'reorder'
+
+/** 一条顺应。字段按 `op` 取用：add→text；remove→target；reorder→order。 */
 export interface AccommodationItem {
+  op: AccommodationOp
   area: Section
-  text: string
+  /** add：新增的一句话要点。 */
+  text?: string
+  /** remove：要删除的现有要点原文（需能在该节定位）。 */
+  target?: string
+  /** reorder：该节重新排序后的条目原文列表（顺序即优先级）。 */
+  order?: string[]
   why: string
   evidence: Evidence[]
 }
@@ -145,6 +160,9 @@ export interface TriggerConfig {
   minNewDiaries: number
   /** 自动模式下的写回策略：propose=只出建议（默认），apply=直接写回。 */
   applyMode: 'propose' | 'apply'
+  /** 安全阀：单次写回最多删几条、最多加几条。 */
+  maxRemovals: number
+  maxAdditions: number
   schedule: ScheduleTriggerConfig
   hook: HookTriggerConfig
 }
