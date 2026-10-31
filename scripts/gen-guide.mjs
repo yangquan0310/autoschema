@@ -15,8 +15,9 @@ AGENTS.md（当前图式：风格/信念/价值观）
       + AutoBioMemory 最近 N 篇日记（经验）
       ↓ system = ANALYSIS_GUIDE + RESPONSE_CONTRACT
       ↓ user   = 图式现状 + 日记正文
-DeepSeek → { equilibriumScore, disequilibrium[], assimilation[], accommodation[], notes }
-      ↓ 校验：target 必须能在现有条目里定位，否则丢弃
+DeepSeek → { equilibriumScore, summary, observations[], suggestions[], notes }
+      ↓ 解析：不符合契约的条目丢弃；propose 只写 pending，不改 AGENTS.md
+      ↓ 显式 apply：定位替换 / 增删重排 + 去重与上限
 AGENTS.md（新版本）+ ~/.autoschema/history/ 快照
 \`\`\`
 

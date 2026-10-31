@@ -1,6 +1,6 @@
 {
   "name": "autoschema",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "AutoSchema — 让 agent 的自我图式（风格/信念/价值观）随日记演化：皮亚杰式的非平衡 → 同化 / 顺应 → 平衡",
   "type": "module",
   "main": "dist/index.js",

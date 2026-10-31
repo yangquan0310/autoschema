@@ -1,6 +1,43 @@
 # Changelog
 
+## [0.3.5] — 2026-10-31
+
+### Fixed（Windows 上的打包与发布链路）
+
+- **从 Windows 打的包，在 Unix 上执行 `autoschema` 报 `bad interpreter`。**
+  根因：仓库此前没有 `.gitattributes`，而本机 `core.autocrlf=true`，git 按 Windows 约定把
+  工作区检出成 CRLF。`dist/` 提交进仓库、`dist/cli.js` 又是 `bin` 入口，于是 shebang 变成
+  `#!/usr/bin/env node\r`，内核去找名为 `node\r` 的解释器。git blob 本身一直是干净的
+  （74217 字节、LF），坏的只是检出。修法：新增 `.gitattributes`（`* text=auto eol=lf`，
+  `*.zstd` / `*.tgz` / `*.sqlite` / 图片显式标 `binary`），并按新属性强制重检出；
+  工作区 `dist/cli.js` 恢复为 74217 字节、shebang 为 LF。
+- **`pnpm run pack:dist` 在 Windows 上只生成 `dist/package/`，产不出 tgz。**
+  根因：`scripts/pack-dist.mjs` 用 `execFileSync('pnpm', …)` 直接调 pnpm，而 Windows 上
+  pnpm 是 `.cmd` shim，Node 不能直接执行它，报 `spawnSync pnpm ENOENT`。
+  修法：抽出 `packWithPnpm()`——win32 下交给 `cmd.exe /d /s /c` 解析命令，其余平台仍直接
+  exec。Windows 上已实测能产出 `dist/autoschema-0.3.5.tgz`。
+- **打包前不拦 CRLF，LF 修好后仍可能被重新检出或手改破坏。**
+  修法：`pack:dist` 在 `dist/index.js` 存在性检查之后增加守卫，`dist/index.js` /
+  `dist/cli.js` 里出现 `\r\n` 直接失败，并提示先用 LF 重新检出再打包。
+- **pnpm 11 下 `pnpm run check` 跑不起来。**
+  根因一：pnpm 11 把构建脚本审批移进 workspace 配置（`onlyBuiltDependencies` 等已移除），
+  默认 `strictDepBuilds`，`esbuild`（tsup/vitest 依赖）的 postinstall 被拦，
+  报 `ERR_PNPM_IGNORED_BUILDS`。修法：新增 `pnpm-workspace.yaml`，`allowBuilds: esbuild: true`。
+  根因二：pnpm 11 默认 `minimumReleaseAge: 1440`（24 小时），且每次 `install` 与 `pnpm run`
+  前的依赖校验都会重新检查 lockfile 里每个条目的发布时间；本仓库 lockfile 锁定的
+  `rollup@4.67.2` 发布不足 24 小时，直接报 `ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION`。
+  修法：`minimumReleaseAge: 0`（lockfile 由唯一维护者提交、随发布一起审查，用它换发布当天
+  可安装；想恢复默认隔离删掉这一行即可）。
+- **Windows 上 `tests/reconcile.test.ts` 有一条用例必红。**
+  根因：断言里硬编码了 POSIX 路径 `/abs/events-b`，而 `path.resolve` 在 Windows 上会补当前
+  盘符（`C:\abs\events-b`）。修法：期望值改用 `path.resolve('/abs/events-b')`，两个平台都成立。
+
+### Docs
+
+- README 安装示例的 `VER` 同步到 `0.3.5`，源码安装段的测试数量更新为 67。
+
 ## [0.3.4] — 2026-10-31
+
 
 ### Fixed（会挡住 dsh 启动的严重问题）
 
