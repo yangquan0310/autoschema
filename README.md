@@ -74,7 +74,7 @@ AutoBioMemory 负责"记住我做过什么"，AutoSchema 负责"据此更新我�
 每个版本都发布预构建产物：
 
 ```bash
-VER=0.3.1
+VER=0.3.5
 curl -L -o autoschema.tgz \
   "https://github.com/yangquan0310/autoschema/releases/download/v$VER/autoschema-$VER.tgz"
 mkdir -p ~/opt/autoschema && tar -xzf autoschema.tgz -C ~/opt/autoschema --strip-components=1
@@ -118,7 +118,7 @@ hook 挂点与冷却在 `~/.autoschema/config.json` 里配：
 
 ```bash
 git clone https://github.com/yangquan0310/autoschema.git && cd autoschema
-pnpm install && pnpm run check      # typecheck + 64 个测试 + build
+pnpm install && pnpm run check      # typecheck + 67 个测试 + build
 node dist/cli.js doctor
 ```
 

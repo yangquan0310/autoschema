@@ -11,7 +11,7 @@ import os2 from "os";
 // src/constants.ts
 import os from "os";
 import path from "path";
-var VERSION = "0.3.4";
+var VERSION = "0.3.5";
 var DEFAULT_AGENTS_FILE = path.join(os.homedir(), ".dsh", "AGENTS.md");
 var DEFAULT_MEMORY_ROOT = path.join(os.homedir(), ".autobiomemory");
 var DEFAULT_STATE_ROOT = path.join(os.homedir(), ".autoschema");
