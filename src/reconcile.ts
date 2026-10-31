@@ -75,7 +75,14 @@ export function gatherDiaries(config: AutoSchemaConfig, limit?: number, since?: 
 export function snapshotSchema(config: AutoSchemaConfig, raw: string): string {
   const historyDir = path.join(config.stateRoot, 'history')
   ensureDir(historyDir)
-  const file = path.join(historyDir, `AGENTS-${timestampForFile()}.md`)
+  // 同一秒内多次快照要各自成文件：加毫秒与递增后缀
+  const stamp = timestampForFile()
+  let file = path.join(historyDir, `AGENTS-${stamp}.md`)
+  let counter = 1
+  while (fs.existsSync(file)) {
+    file = path.join(historyDir, `AGENTS-${stamp}-${counter}.md`)
+    counter += 1
+  }
   writeTextAtomic(file, raw)
   const logFile = path.join(historyDir, 'changelog.jsonl')
   const line = JSON.stringify({ at: nowIso(), file, chars: raw.length })

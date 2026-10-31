@@ -60,7 +60,10 @@ export function configFile(stateRoot: string): string {
 
 export function loadConfig(options: { stateRoot?: string; patch?: DeepPartial<AutoSchemaConfig> } = {}): AutoSchemaConfig {
   const base = defaultConfig()
-  const stateRoot = path.resolve(options.stateRoot ?? base.stateRoot)
+  const patchRoot = options.patch?.stateRoot
+  const stateRoot = path.resolve(
+    options.stateRoot ?? (typeof patchRoot === 'string' && patchRoot !== '' ? patchRoot : base.stateRoot),
+  )
   const onDisk = readJsonFile<DeepPartial<AutoSchemaConfig>>(configFile(stateRoot))
   const merged = merge(merge(base, onDisk), options.patch)
   merged.stateRoot = stateRoot
