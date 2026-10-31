@@ -136,7 +136,9 @@ export function apply(ctx: Context, pluginConfig: PluginConfig = {}): void {
     ctx.on('agent/created', (() => fire('session/start')) as never)
   }
 
-  cLogger.info(`AutoSchema hook 已启用：${events.join(', ')}（applyMode=${config.trigger.applyMode}）`)
+  cLogger.info(
+    `AutoSchema hook 已启用：${events.join(', ')}（只产出建议，不修改 AGENTS.md）`,
+  )
 }
 
 export default { name, inject, Config, apply }

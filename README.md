@@ -17,20 +17,74 @@
 它是 [AutoBioMemory](https://github.com/yangquan0310/autobiomemory) 的姊妹项目：
 AutoBioMemory 负责"记住我做过什么"，AutoSchema 负责"据此更新我是谁"。
 
+## 完整流程（它就是四步）
+
+```
+① 配置闸门：trigger.modes / cooldown / minNewDiaries 判断"现在要不要跑"
+        ↓
+② 组装输入：要处理的日记（可配多个目录）+ 指导语 + 当前 AGENTS.md
+        ↓
+③ 交给 LLM（DeepSeek）→ 返回建议 JSON
+        ↓
+④ agent 自己决定：采纳哪几条（tool 只给建议，不替 agent 改文件）
+```
+
+**插件不改 `AGENTS.md`**。`propose` 只产出建议；是否落地由 agent/人决定，
+需要时用 `apply --ids s1,s3` 精确采纳（写前自动快照）。
+
+## 建议 JSON 长什么样
+
+每条建议都必须写明**怎么改**：
+
+| op | 含义 | 必填字段 |
+| --- | --- | --- |
+| `add` | 增：新增一条要点 | `value` |
+| `remove` | 删：删除一条要点（**顺应**的一种） | `target` |
+| `modify` | 改：改写措辞（**同化**） | `target` + `value` |
+| `reorder` | 重排：**价值观的优先级**（`order` 即顺序） | `order`（≥2 条） |
+
+```jsonc
+{
+  "equilibriumScore": 0.42,
+  "summary": "我在『先给结论』上不稳定",
+  "observations": [
+    { "area": "style", "observed": "…", "against": "说话简洁，先给结论",
+      "conflict": "…", "severity": "medium",
+      "evidence": [{ "eventId": "ev_…", "title": "…", "quote": "…" }] }
+  ],
+  "suggestions": [
+    { "id": "s1", "area": "style", "op": "modify",
+      "target": "说话简洁，先给结论", "value": "开口先给结论；需要背景时放在结论之后",
+      "piaget": "assimilation", "reason": "…", "evidence": [], "confidence": 0.8,
+      "severity": "medium", "risk": "汇报可能变长" },
+    { "id": "s2", "area": "value", "op": "reorder",
+      "order": ["长期 > 短期", "安全 > 进度", "事实 > 面子"],
+      "piaget": "accommodation", "reason": "…", "evidence": [], "confidence": 0.7, "severity": "medium" }
+  ],
+  "notes": "…"
+}
+```
+
 ## 安装与使用
 
 ```bash
 git clone https://github.com/yangquan0310/autoschema.git && cd autoschema
 pnpm install && pnpm run build
-node dist/cli.js doctor            # 自检（密钥 / 日记 / 图式 / DeepSeek）
-node dist/cli.js analyze           # 出建议，不写回
-node dist/cli.js apply             # 写回 AGENTS.md（先快照）
-node dist/cli.js show              # 打印当前解析出的图式
-node dist/cli.js history           # 历次快照
+node dist/cli.js doctor          # 自检：目录 / 密钥 / 日记篇数 / DeepSeek 连通性
+node dist/cli.js propose         # 出建议（不改任何文件）
+node dist/cli.js pending         # 看待审建议摘要
+node dist/cli.js apply --ids s1  # 采纳第 1 条（写前快照）
 ```
 
-只依赖 `~/.dsh/AGENTS.md` 与 `~/.autobiomemory/events/`，不引入任何运行时依赖
-（Node 内置 `fetch` 直连 DeepSeek）。
+日记位置在 `config.json` 里配（支持多个目录）：
+
+```jsonc
+"diaries": {
+  "dirs": ["~/.autobiomemory/events", "/data/another-memory/events"],
+  "includeGlobs": ["*.json"],
+  "strict": false        // true = 不回落到 memoryRoot/events
+}
+```
 
 ## 什么时候跑（触发方式）
 

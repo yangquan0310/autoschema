@@ -2,6 +2,8 @@
 
 import path from 'node:path'
 
+import os from 'node:os'
+
 import { DEFAULT_AGENTS_FILE, DEFAULT_MEMORY_ROOT, DEFAULT_STATE_ROOT } from './constants.js'
 import { clamp, readJsonFile, resolveDeepseekKey, writeJsonFile, ensureDir } from './util.js'
 import type { AutoSchemaConfig } from './types.js'
@@ -15,6 +17,7 @@ export function defaultConfig(): AutoSchemaConfig {
     version: 1,
     agentsFile: DEFAULT_AGENTS_FILE,
     memoryRoot: DEFAULT_MEMORY_ROOT,
+    diaries: { dirs: [], includeGlobs: ['*.json'], strict: false },
     diaryLimit: 30,
     diaryChars: 1800,
     maxInputChars: 60_000,
@@ -23,7 +26,8 @@ export function defaultConfig(): AutoSchemaConfig {
       modes: ['manual'],
       cooldownMs: 3_600_000,
       minNewDiaries: 5,
-      applyMode: 'propose',
+      maxRemovals: 2,
+      maxAdditions: 4,
       schedule: { intervalMinutes: 1_440, skipIfOverdueMinutes: 720 },
       hook: { events: ['compaction/start'], cooldownMs: 1_800_000 },
     },
@@ -102,7 +106,25 @@ export function loadConfig(options: { stateRoot?: string; patch?: DeepPartial<Au
   merged.trigger.cooldownMs = Math.max(0, merged.trigger.cooldownMs)
   merged.trigger.hook.cooldownMs = Math.max(0, merged.trigger.hook.cooldownMs)
   merged.trigger.minNewDiaries = Math.max(1, Math.round(merged.trigger.minNewDiaries))
+  merged.trigger.maxRemovals = Math.max(0, Math.round(merged.trigger.maxRemovals ?? 2))
+  merged.trigger.maxAdditions = Math.max(1, Math.round(merged.trigger.maxAdditions ?? 4))
   merged.trigger.schedule.intervalMinutes = Math.max(1, Math.round(merged.trigger.schedule.intervalMinutes))
+  // 日记目录：展开 ~、转绝对路径、去重
+  const expand = (entry: string): string => {
+    const trimmed = entry.trim()
+    if (trimmed === '') return ''
+    const withHome = trimmed === '~' ? os.homedir() : trimmed.startsWith('~/') ? path.join(os.homedir(), trimmed.slice(2)) : trimmed
+    return path.resolve(withHome)
+  }
+  const dirs = Array.isArray(merged.diaries?.dirs) ? merged.diaries.dirs : []
+  merged.diaries = {
+    dirs: [...new Set(dirs.map(expand).filter((entry) => entry !== ''))],
+    includeGlobs:
+      Array.isArray(merged.diaries?.includeGlobs) && merged.diaries.includeGlobs.length > 0
+        ? merged.diaries.includeGlobs
+        : ['*.json'],
+    strict: merged.diaries?.strict === true,
+  }
   merged.agentsFile = path.resolve(merged.agentsFile)
   merged.memoryRoot = path.resolve(merged.memoryRoot)
   return merged
@@ -137,8 +159,11 @@ export function validateConfig(config: AutoSchemaConfig): string[] {
   if (config.trigger.modes.includes('hook') && config.trigger.hook.events.length === 0) {
     problems.push('hook 模式下 trigger.hook.events 不能为空（要挂"特定的"生命周期点）')
   }
-  if (config.trigger.applyMode !== 'propose' && config.trigger.applyMode !== 'apply') {
-    problems.push("trigger.applyMode 只能是 propose 或 apply")
+  if (config.diaries.dirs.some((dir) => !path.isAbsolute(dir))) {
+    problems.push('diaries.dirs 必须是绝对路径（支持 ~ 展开）')
+  }
+  if (typeof config.trigger.maxRemovals === 'number' && config.trigger.maxRemovals < 0) {
+    problems.push('trigger.maxRemovals 不能为负')
   }
   return problems
 }
