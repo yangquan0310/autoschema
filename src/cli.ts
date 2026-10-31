@@ -10,13 +10,24 @@
  *   autoschema doctor    环境自检（密钥 / 日记 / 图式 / 连通性）
  */
 
+import fs from 'node:fs'
 import path from 'node:path'
 
 import { loadConfig, ensureConfigFile, validateConfig, resolveApiKey, configFile } from './config.js'
 import { DeepseekError } from './deepseek.js'
-import { listEventIds } from './diaries.js'
+import { listEventIds, resolveDiaryDirs } from './diaries.js'
 import { DeepseekClient } from './deepseek.js'
-import { applyProposal, clearPending, listHistory, loadPending, readSchema, renderReport, run } from './reconcile.js'
+import {
+  applyPending,
+  applySelected,
+  clearPending,
+  listHistory,
+  loadPending,
+  propose,
+  readSchema,
+  renderReport,
+  run,
+} from './reconcile.js'
 import { checkDue, cronLine } from './schedule.js'
 import { loadCursor, pendingEventIds, resetCursor } from './cursor.js'
 import { tick } from './tick.js'
@@ -63,13 +74,13 @@ const num = (args: Args, key: string): number | undefined => {
 const bool = (args: Args, key: string): boolean => args.flags.has(key)
 
 function help(): void {
-  process.stdout.write(`AutoSchema 0.2.1 — 让自我图式随日记演化（皮亚杰：非平衡 → 同化/顺应 → 平衡）
+  process.stdout.write(`AutoSchema 0.3.0 — 让自我图式随日记演化（皮亚杰：非平衡 → 同化/顺应 → 平衡）
 
 用法：autoschema <command> [options]
 
 命令：
-  analyze      分析并打印建议（不写回）；--limit N --since ISO --all --json
-  apply        落盘待审建议（若有 pending 则不再调模型）；--re-analyze 强制重算
+  propose      产出建议（默认只读，不改 AGENTS.md）；--limit N --since ISO --all --json
+  apply        采纳建议写回 AGENTS.md（需先 propose）：--ids s1,s3 精确采纳；缺省全采纳
   tick         供 cron/timer 调用：按闸门判断该不该跑，该跑才跑
   daemon       内置循环：每 N 秒检查一次闸门（默认 60s）
   cron         打印建议的 crontab 行
@@ -84,6 +95,7 @@ function help(): void {
 通用：
   --agents <file>   AGENTS.md 路径（默认 ~/.dsh/AGENTS.md）
   --memory <dir>    AutoBioMemory 数据根（默认 ~/.autobiomemory）
+  --diaries <dirs>  日记目录，逗号分隔（覆盖 config.diaries.dirs）
   --state <dir>     本工具状态根（默认 ~/.autoschema）
   --verbose         调试日志
 `)
@@ -98,7 +110,7 @@ async function main(): Promise<number> {
     return 0
   }
   if (args.command === '--version' || args.command === 'version') {
-    process.stdout.write('AutoSchema 0.2.1\n')
+    process.stdout.write('AutoSchema 0.3.0\n')
     return 0
   }
 
@@ -107,6 +119,16 @@ async function main(): Promise<number> {
     patch: {
       ...(str(args, 'agents') === undefined ? {} : { agentsFile: path.resolve(str(args, 'agents') as string) }),
       ...(str(args, 'memory') === undefined ? {} : { memoryRoot: path.resolve(str(args, 'memory') as string) }),
+      ...(str(args, 'diaries') === undefined
+        ? {}
+        : {
+            diaries: {
+              dirs: (str(args, 'diaries') as string)
+                .split(',')
+                .map((entry) => entry.trim())
+                .filter((entry) => entry !== ''),
+            } as never,
+          }),
     },
   })
 
@@ -148,16 +170,16 @@ async function main(): Promise<number> {
       return 0
     }
 
-    case 'analyze': {
+    case 'analyze':
+    case 'propose': {
       const problems = validateConfig(config)
       if (problems.length > 0) {
         process.stderr.write(`配置有问题：\n${problems.map((p) => `  - ${p}`).join('\n')}\n`)
         return 2
       }
-      const result = await run({
+      const result = await propose({
         config,
         logger,
-        dryRun: true,
         onlyUndigested: bool(args, 'all') ? false : undefined,
         ...(num(args, 'limit') === undefined ? {} : { limit: num(args, 'limit') as number }),
         ...(str(args, 'since') === undefined ? {} : { since: str(args, 'since') as string }),
@@ -168,33 +190,36 @@ async function main(): Promise<number> {
     }
 
     case 'apply': {
-      const problems = validateConfig(config)
-      if (problems.length > 0) {
-        process.stderr.write(`配置有问题：\n${problems.map((p) => `  - ${p}`).join('\n')}\n`)
+      // 只做"采纳"，不做分析；分析请先运行 propose。
+      const ids = str(args, 'ids')
+        ?.split(',')
+        .map((s) => s.trim())
+        .filter((s) => s !== '')
+      const pending = loadPending(config)
+      if (pending === undefined) {
+        process.stderr.write('没有待审建议。先运行 `autoschema propose`。\n')
         return 2
       }
-      const pending = loadPending(config)
-      if (pending !== undefined && !bool(args, 're-analyze')) {
-        const applied = applyProposal(config, pending)
-        process.stdout.write(
-          [
-            `已落盘 pending 建议（${pending.at}）：同化 ${applied.applied.assimilation} · 顺应 ${applied.applied.accommodation}`,
-            ...applied.skipped.map((reason) => `  跳过：${reason}`),
-            applied.snapshot === undefined ? '（无变更，未写文件）' : `快照：${applied.snapshot}`,
-            `已写回：${config.agentsFile}`,
-          ].join('\n') + '\n',
-        )
-        return 0
+      const suggestions = pending.analysis.suggestions
+      if (ids !== undefined) {
+        const unknown = ids.filter((id) => !suggestions.some((s) => s.id === id))
+        if (unknown.length > 0) {
+          process.stderr.write(`未知建议 id：${unknown.join(', ')}（可选：${suggestions.map((s) => s.id).join(', ')}）\n`)
+          return 2
+        }
       }
-      const result = await run({
-        config,
-        logger,
-        dryRun: false,
-        ...(num(args, 'limit') === undefined ? {} : { limit: num(args, 'limit') as number }),
-        ...(str(args, 'since') === undefined ? {} : { since: str(args, 'since') as string }),
-      })
-      if (bool(args, 'json')) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`)
-      else process.stdout.write(`${renderReport(result)}\n`)
+      const result = applySelected(config, suggestions, ids === undefined ? {} : { ids })
+      process.stdout.write(
+        [
+          `采纳：增 ${result.applied.add} · 删 ${result.applied.remove} · 改 ${result.applied.modify} · 重排 ${result.applied.reorder}`,
+          ...result.rejected.map((reason: string) => `  拒绝：${reason}`),
+          result.changed ? `已写回：${config.agentsFile}` : '无实际变更（未写文件）',
+          result.snapshot === undefined ? '' : `快照：${result.snapshot}`,
+        ]
+          .filter((line) => line !== '')
+          .join('\n') + '\n',
+      )
+      if (result.changed && bool(args, 'clear')) clearPending(config)
       return 0
     }
 
@@ -262,10 +287,11 @@ async function main(): Promise<number> {
       process.stdout.write(
         [
           `待落盘建议：${pending.at}（批次 ${pending.runId}）`,
-          `  非平衡 ${pending.analysis.disequilibrium.length} · 同化 ${pending.analysis.assimilation.length} · 顺应 ${pending.analysis.accommodation.length}`,
+          `  非平衡 ${pending.analysis.observations.length} · 建议 ${pending.analysis.suggestions.length}（增/删/改/重排：${pending.analysis.suggestions.map((s) => s.op).join(',') || '无'}）`,
           `  涉及日记 ${pending.eventIds.length} 篇`,
-          `  落盘：autoschema apply`,
-          `  丢弃：autoschema apply --discard`,
+          `  逐条采纳：autoschema apply --ids <id,...>`,
+          `  全部采纳：autoschema apply --clear`,
+          `  丢弃建议：autoschema pending --discard`,
         ].join('\n') + '\n',
       )
       if (bool(args, 'discard')) {
@@ -291,8 +317,14 @@ async function main(): Promise<number> {
       push('状态目录', true, config.stateRoot)
       push('配置文件', true, configFile(config.stateRoot))
       push('DeepSeek key', key !== undefined, maskSecret(key))
-      const diaries = listEventIds(config.memoryRoot).length
-      push('日记数量', diaries > 0, `${diaries} 篇（${path.join(config.memoryRoot, 'events')}）`)
+      const dirsUsed = resolveDiaryDirs(config)
+      const diaries = listEventIds(dirsUsed).length
+      push(
+        '日记目录',
+        dirsUsed.length > 0 && dirsUsed.every((dir) => fs.existsSync(dir)),
+        dirsUsed.join('、') || '(未配置)',
+      )
+      push('日记数量', diaries > 0, `${diaries} 篇`)
       const doc = readSchema(config)
       push('AGENTS.md', true, `${config.agentsFile}（风格 ${doc.style.length} / 信念 ${doc.belief.length} / 价值观 ${doc.value.length}）`)
       push('配置校验', validateConfig(config).length === 0, validateConfig(config).join('；') || '通过')

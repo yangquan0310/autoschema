@@ -11,8 +11,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
-import { applyChanges, parseSchemaDoc, renderSchemaDoc, writeSchemaDoc } from './agents-md.js'
-import { collectDiaries, renderDiaries } from './diaries.js'
+import { applySuggestions, parseSchemaDoc, renderSchemaDoc, writeSchemaDoc } from './agents-md.js'
+import { collectDiaries, renderDiaries, resolveDiaryDirs } from './diaries.js'
 import { filterUndigested, loadCursor, markDigested, markProposed, markRun, saveCursor } from './cursor.js'
 import { DeepseekClient } from './deepseek.js'
 import { buildAnalysisRequest, parseAnalysisResponse } from './prompt.js'
@@ -30,6 +30,8 @@ import {
 import { SECTION_LABELS } from './types.js'
 import type {
   Analysis,
+  ApplyResult,
+  Suggestion,
   AutoSchemaConfig,
   ChatClient,
   DiaryEntry,
@@ -59,22 +61,14 @@ export interface RunOptions {
 
 export interface RunResult {
   analysis: Analysis
-  /** 本次实际消化（喂进去）的日记 id。 */
+  /** 本次实际喂进去的日记 id。 */
   digestedIds: string[]
-  /** 因已消化被跳过的篇数。 */
+  /** 因"已处理过"被跳过的篇数。 */
   skippedDigested: number
-  /** 变更前的图式。 */
-  before: SchemaDoc
-  /** 变更后的图式（dryRun 时等于 before 加变更的草案，不落盘）。 */
-  after: SchemaDoc
-  applied: { assimilation: number; accommodation: number }
-  skipped: string[]
   diaries: DiaryEntry[]
+  /** 当前图式渲染（未改动）。 */
   rendered: string
-  /** 写回成功后的快照路径。 */
-  snapshot?: string
-  wrote: boolean
-  /** 建议已存为待落盘（供 `apply` 直接消费，不必再调模型）。 */
+  /** 建议已存为待审（供 apply --from-pending 消费）。 */
   pendingSaved: boolean
 }
 
@@ -84,9 +78,20 @@ export function readSchema(config: AutoSchemaConfig): SchemaDoc {
   return parseSchemaDoc(raw)
 }
 
+/** 取 DeepSeek 密钥或抛出可读错误。 */
+function requireApiKey(config: AutoSchemaConfig): string {
+  const key = resolveApiKey(config)
+  if (key === undefined || key === '') {
+    throw new Error(
+      '缺少 DEEPSEEK_API_KEY：请写入 ~/.dsh/.env、~/.autobiomemory/.env 或 ~/.autoschema/.env，或用环境变量提供。',
+    )
+  }
+  return key
+}
+
 /** 采集日记。 */
 export function gatherDiaries(config: AutoSchemaConfig, limit?: number, since?: string): DiaryEntry[] {
-  return collectDiaries(config.memoryRoot, {
+  return collectDiaries(resolveDiaryDirs(config), {
     limit: limit ?? config.diaryLimit,
     maxChars: config.maxInputChars,
     diaryChars: config.diaryChars,
@@ -114,14 +119,13 @@ export function snapshotSchema(config: AutoSchemaConfig, raw: string): string {
 }
 
 /**
- * 一次分析（不写回）。
+ * 一次分析 —— **只产出建议，绝不改 AGENTS.md**。
  *
- * 传 `dryRun: false` 时才把结果写进 AGENTS.md（先快照）。
+ * 建议同时写入 `state/pending.json`（供 agent 之后挑选采纳）与 `state/last-run.json`（摘要）。
  */
-export async function run(options: RunOptions): Promise<RunResult> {
+export async function propose(options: RunOptions): Promise<RunResult> {
   const { config } = options
   const logger = options.logger ?? createLogger()
-  const dryRun = options.dryRun !== false
 
   const before = readSchema(config)
   const onlyUndigested = options.onlyUndigested ?? config.digest.onlyUndigested
@@ -132,11 +136,13 @@ export async function run(options: RunOptions): Promise<RunResult> {
   if (diaries.length === 0) {
     throw new Error(
       gathered.length === 0
-        ? `没有可用日记：${config.memoryRoot}/events 为空，或 since/limit 过滤后无内容。先跑一次 AutoBioMemory 的整理。`
-        : `没有"未消化"的日记（最近 ${gathered.length} 篇都已吸收）。用 --all 或 digest.onlyUndigested=false 重新分析全部。`,
+        ? `没有可用日记：${resolveDiaryDirs(config).join('、') || '(未配置 diaries.dirs)'} 为空，或 since/limit 过滤后无内容。先跑一次 AutoBioMemory 的整理，或在 config.json 的 diaries.dirs 里指向正确的目录。`
+        : `没有"未消化"的日记（最近 ${gathered.length} 篇都已处理过）。用 --all 或 digest.onlyUndigested=false 重新分析全部。`,
     )
   }
-  logger.info(`图式：风格 ${before.style.length} / 信念 ${before.belief.length} / 价值观 ${before.value.length} 条；日记 ${diaries.length} 篇`)
+  logger.info(
+    `图式：风格 ${before.style.length} / 信念 ${before.belief.length} / 价值观 ${before.value.length} 条；日记 ${diaries.length} 篇`,
+  )
 
   const client = options.client ?? new DeepseekClient(config.deepseek, requireApiKey(config), logger)
   const renderedDiaries = renderDiaries(diaries)
@@ -147,78 +153,43 @@ export async function run(options: RunOptions): Promise<RunResult> {
   ])
   const analysis = parseAnalysisResponse(raw)
 
-  const merged = applyChanges(before, analysis.assimilation, analysis.accommodation)
-  const rendered = renderSchemaDoc(merged.doc)
-
-  let snapshot: string | undefined
-  let wrote = false
-  if (!dryRun && (merged.applied.assimilation > 0 || merged.applied.accommodation > 0)) {
-    const original = readTextFile(config.agentsFile) ?? ''
-    snapshot = snapshotSchema(config, original)
-    writeSchemaDoc(config.agentsFile, merged.doc)
-    wrote = true
-    logger.info(`已写回 ${config.agentsFile}（快照：${snapshot}）`)
-  }
-
   const runId = options.runId ?? nowIso()
   const ids = diaries.map((entry) => entry.eventId)
-  const proposedCount = analysis.assimilation.length + analysis.accommodation.length
-  let pendingSaved = false
-  if (options.markDigested !== false) {
-    const next = wrote
-      ? markDigested(cursor, ids, runId)
-      : proposedCount > 0
-        ? markProposed(cursor, ids, runId)
-        : markRun(cursor, runId)
-    saveCursor(config.stateRoot, next)
-    if (!wrote && proposedCount > 0) {
-      writeJsonFile(pendingFile(config.stateRoot), { at: nowIso(), runId, analysis, eventIds: ids })
-      pendingSaved = true
-    }
-  }
-
-  const result: RunResult = {
-    analysis,
-    digestedIds: diaries.map((entry) => entry.eventId),
-    skippedDigested,
-    before,
-    after: merged.doc,
-    applied: merged.applied,
-    skipped: merged.skipped,
-    diaries,
-    rendered,
-    wrote,
-    pendingSaved,
-    ...(snapshot === undefined ? {} : { snapshot }),
+  saveCursor(
+    config.stateRoot,
+    analysis.suggestions.length > 0 ? markProposed(cursor, ids, runId) : markRun(cursor, runId),
+  )
+  const pendingSaved = analysis.suggestions.length > 0
+  if (pendingSaved) {
+    writeJsonFile(pendingFile(config.stateRoot), { at: nowIso(), runId, analysis, eventIds: ids })
   }
   writeJsonFile(path.join(config.stateRoot, 'last-run.json'), {
     at: nowIso(),
-    dryRun,
     equilibriumScore: analysis.equilibriumScore,
-    diarised: diaries.length,
-    applied: merged.applied,
-    skipped: merged.skipped,
-    wrote,
+    observations: analysis.observations.length,
+    suggestions: analysis.suggestions.length,
+    diaries: diaries.length,
   })
-  return result
-}
 
-function requireApiKey(config: AutoSchemaConfig): string {
-  const key = resolveApiKey(config)
-  if (key === undefined || key === '') {
-    throw new Error(
-      '缺少 DEEPSEEK_API_KEY：请写入 ~/.dsh/.env、~/.autobiomemory/.env 或 ~/.autoschema/.env，或用环境变量提供。',
-    )
+  return {
+    analysis,
+    digestedIds: ids,
+    skippedDigested,
+    diaries,
+    rendered: renderSchemaDoc(before),
+    pendingSaved,
   }
-  return key
 }
 
-/** 待落盘建议的位置。 */
+/** 兼容旧名字（`run` 现在等同于"只出建议"）。 */
+export const run = propose
+
+/** 待审建议文件位置。 */
 export function pendingFile(stateRoot: string): string {
   return path.join(stateRoot, 'state', 'pending.json')
 }
 
-/** 读取待落盘建议。 */
+/** 读取待审建议。 */
 export function loadPending(config: AutoSchemaConfig): PendingProposal | undefined {
   return readJsonFile<PendingProposal>(pendingFile(config.stateRoot))
 }
@@ -231,45 +202,84 @@ export function clearPending(config: AutoSchemaConfig): void {
   }
 }
 
+export interface ApplySelectionOptions {
+  /** 只采纳这些建议 id；缺省=全部。 */
+  ids?: string[]
+  /** 运行批次（写进快照历史）。 */
+  runId?: string
+}
+
 /**
- * 直接落盘一份已算好的建议（`analyze` 之后 `apply`，不再调模型）。
+ * 采纳建议并写回 —— **只由显式调用触发**（`autoschema apply --ids s1,s3`）。
+ *
+ * 写前先快照；定位不到的建议进 `rejected`，不做猜测性降级。
  */
-export function applyProposal(
+export function applySelected(
   config: AutoSchemaConfig,
-  proposal: PendingProposal,
-  options: { runId?: string } = {},
-): { after: SchemaDoc; applied: { assimilation: number; accommodation: number }; skipped: string[]; snapshot?: string; rendered: string } {
+  suggestions: Suggestion[],
+  options: ApplySelectionOptions = {},
+): ApplyResult {
   const before = readSchema(config)
-  const merged = applyChanges(before, proposal.analysis.assimilation, proposal.analysis.accommodation)
-  const rendered = renderSchemaDoc(merged.doc)
+  const outcome = applySuggestions(before, suggestions, {
+    ...(options.ids === undefined ? {} : { ids: options.ids }),
+    maxRemovals: config.trigger.maxRemovals,
+    maxAdditions: config.trigger.maxAdditions,
+  })
+  const changed =
+    outcome.applied.add + outcome.applied.remove + outcome.applied.modify + outcome.applied.reorder > 0
   let snapshot: string | undefined
-  if (merged.applied.assimilation + merged.applied.accommodation > 0) {
+  if (changed) {
     snapshot = snapshotSchema(config, readTextFile(config.agentsFile) ?? '')
-    writeSchemaDoc(config.agentsFile, merged.doc)
+    writeSchemaDoc(config.agentsFile, outcome.doc)
   }
-  const cursor = loadCursor(config.stateRoot)
-  saveCursor(config.stateRoot, markDigested(cursor, proposal.eventIds, options.runId ?? proposal.runId))
-  clearPending(config)
   return {
-    after: merged.doc,
-    applied: merged.applied,
-    skipped: merged.skipped,
-    rendered,
+    changed,
+    doc: outcome.doc,
+    rendered: outcome.rendered,
+    applied: outcome.applied,
+    rejected: outcome.rejected,
     ...(snapshot === undefined ? {} : { snapshot }),
   }
 }
 
-/** 人类可读报告（CLI 与测试共用）。 */
+/** 采纳待审建议（`autoschema apply --from-pending`）。 */
+export function applyPending(
+  config: AutoSchemaConfig,
+  options: ApplySelectionOptions = {},
+): { result: ApplyResult; cursorMarked: number } {
+  const pending = loadPending(config)
+  if (pending === undefined) throw new Error('没有待审建议（先运行 autoschema propose）')
+  const result = applySelected(config, pending.analysis.suggestions, options)
+  const cursor = loadCursor(config.stateRoot)
+  const accepted = options.ids === undefined
+    ? pending.eventIds
+    : pending.analysis.suggestions.filter((s) => options.ids?.includes(s.id)).length > 0
+      ? pending.eventIds
+      : []
+  if (accepted.length > 0 && result.changed) {
+    saveCursor(config.stateRoot, markDigested(cursor, accepted, options.runId ?? pending.runId))
+  }
+  if (options.ids === undefined) clearPending(config)
+  return { result, cursorMarked: accepted.length }
+}
+
+const OP_LABELS: Record<Suggestion['op'], string> = {
+  add: '增',
+  remove: '删',
+  modify: '改',
+  reorder: '重排',
+}
+
+/** 人类可读报告（CLI 与测试共用）。**只讲建议，不讲"已写回"**。 */
 export function renderReport(result: RunResult): string {
-  const { analysis, applied, skipped } = result
+  const { analysis } = result
   const lines: string[] = []
-  const pct = Math.round(analysis.equilibriumScore * 100)
-  lines.push(`平衡度：${pct}%（0=完全冲突，100=完全自洽）`)
+  lines.push(`平衡度：${Math.round(analysis.equilibriumScore * 100)}%（0=完全冲突，100=完全自洽）`)
   if (analysis.summary !== '') lines.push(`总览：${analysis.summary}`)
   lines.push('')
 
-  lines.push(`非平衡 ${analysis.disequilibrium.length} 条`)
-  for (const item of analysis.disequilibrium) {
+  lines.push(`非平衡观察 ${analysis.observations.length} 条`)
+  for (const item of analysis.observations) {
     lines.push(`  · [${SECTION_LABELS[item.area]}·${item.severity}] ${item.observed}`)
     lines.push(`    冲突对象：${item.against}`)
     if (item.conflict !== '') lines.push(`    张力：${item.conflict}`)
@@ -279,35 +289,39 @@ export function renderReport(result: RunResult): string {
   }
   lines.push('')
 
-  lines.push(`同化 ${analysis.assimilation.length} 条（实际应用 ${applied.assimilation}）`)
-  for (const item of analysis.assimilation) {
-    lines.push(`  · [${SECTION_LABELS[item.area]}] ${item.target}`)
-    lines.push(`    → ${item.revised}`)
-    if (item.why !== '') lines.push(`    理由：${item.why}`)
+  lines.push(`建议 ${analysis.suggestions.length} 条（是否采纳由你决定）`)
+  for (const suggestion of analysis.suggestions) {
+    const label = OP_LABELS[suggestion.op]
+    lines.push(`  · ${suggestion.id} [${SECTION_LABELS[suggestion.area]}·${label}] ${
+      suggestion.op === 'reorder'
+        ? `新顺序：${(suggestion.order ?? []).join(' → ')}`
+        : suggestion.op === 'add'
+          ? `+ ${suggestion.value ?? ''}`
+          : suggestion.op === 'remove'
+            ? `- ${suggestion.target ?? ''}`
+            : `${suggestion.target ?? ''} → ${suggestion.value ?? ''}`
+    }`)
+    lines.push(`    皮亚杰：${suggestion.piaget === 'assimilation' ? '同化（改措辞）' : '顺应（改结构）'}｜把握 ${Math.round(suggestion.confidence * 100)}%｜${suggestion.severity}`)
+    if (suggestion.reason !== '') lines.push(`    理由：${suggestion.reason}`)
+    if (suggestion.risk !== undefined) lines.push(`    风险：${suggestion.risk}`)
+    for (const evidence of suggestion.evidence.slice(0, 3)) {
+      lines.push(`    证据：${evidence.eventId}${evidence.quote === undefined ? '' : ` 「${evidence.quote}」`}`)
+    }
   }
-  lines.push('')
 
-  lines.push(`顺应 ${analysis.accommodation.length} 条（实际应用 ${applied.accommodation}）`)
-  for (const item of analysis.accommodation) {
-    lines.push(`  · [${SECTION_LABELS[item.area]}] ${item.text}`)
-    if (item.why !== '') lines.push(`    理由：${item.why}`)
-  }
-
-  if (skipped.length > 0) {
-    lines.push('')
-    lines.push(`已跳过：`)
-    for (const reason of skipped) lines.push(`  · ${reason}`)
-  }
   if (analysis.notes !== '') {
     lines.push('')
     lines.push(`备注：${analysis.notes}`)
   }
   lines.push('')
-  lines.push(result.wrote ? `已写回：${result.snapshot ?? '(无快照)'}` : '未写回（dry-run，加 --apply 才落盘）')
+  lines.push(
+    result.pendingSaved
+      ? `建议已存为待审：${'~/.autoschema/state/pending.json'}（采纳：autoschema apply --ids s1,s3）`
+      : '没有需要落地的建议（图式与经验基本自洽）。',
+  )
   return lines.join('\n')
 }
 
-/** 图式变更历史。 */
 export function listHistory(config: AutoSchemaConfig): Array<{ at: string; file: string; chars: number }> {
   const logFile = path.join(config.stateRoot, 'history', 'changelog.jsonl')
   const text = readTextFile(logFile)

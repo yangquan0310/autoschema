@@ -8,7 +8,7 @@
 
 import { readTextFile, writeTextAtomic } from './util.js'
 import { SECTION_LABELS } from './types.js'
-import type { AccommodationItem, AssimilationItem, SchemaDoc, Section } from './types.js'
+import type { SchemaDoc, Section, Suggestion } from './types.js'
 
 const HEADING_PATTERNS: Array<{ section: Section; pattern: RegExp }> = [
   { section: 'style', pattern: /^#{1,3}\s*风格/u },
@@ -184,66 +184,156 @@ export function findClosestIndex(items: string[], target: string): number {
   return bestScore >= 0.5 ? best : -1
 }
 
-export interface MergeOptions {
-  /** 同化时允许的最大"就近匹配"阈值；找不到目标则跳过。 */
-  minMatch?: number
+export interface ApplyOptions {
+  /** 只采纳这些 id；缺省表示全部采纳。 */
+  ids?: string[]
+  /** 单次最多删几条（默认 2）。 */
+  maxRemovals?: number
+  /** 单次最多新增几条（默认 4）。 */
+  maxAdditions?: number
+}
+
+export interface ApplyOutcome {
+  doc: SchemaDoc
+  rendered: string
+  applied: { add: number; remove: number; modify: number; reorder: number }
+  /** 未采纳 / 无法定位的建议及原因。 */
+  rejected: string[]
+}
+
+function describe(area: Section, op: string, what: string): string {
+  return `[${SECTION_LABELS[area]}·${op}] ${what}`
 }
 
 /**
- * 应用同化与顺应。
+ * 采纳建议（**只由显式调用触发**，默认流程从不执行它）。
  *
- * - 同化：定位 `target` 现有条目并替换为 `revised`；定位不到时记入 `skipped`（不凭空新增，
- *   避免把"改写"退化成"追加"而污染图式）。
- * - 顺应：同一节内按文本去重后追加到末尾。
+ * 建议本身只描述"怎么改"，这里负责定位与落地：
+ * - `modify`：就近匹配 `target` → 替换为 `value`
+ * - `add`：同节去重后追加
+ * - `remove`：就近匹配 `target` → 删除（不删空该节、受 maxRemovals 限制）
+ * - `reorder`：按 `order` 重排（未提及的条目按原相对顺序排在末尾，不丢弃）
+ *
+ * 定位不到就进 `rejected`，**绝不**把"改"悄悄变成"增"。
  */
-export function applyChanges(
+export function applySuggestions(
   doc: SchemaDoc,
-  assimilation: AssimilationItem[],
-  accommodation: AccommodationItem[],
-  options: MergeOptions = {},
-): { doc: SchemaDoc; applied: { assimilation: number; accommodation: number }; skipped: string[] } {
+  suggestions: Suggestion[],
+  options: ApplyOptions = {},
+): ApplyOutcome {
   const next: SchemaDoc = structuredClone(doc)
-  const skipped: string[] = []
-  let appliedAssimilation = 0
-  let appliedAccommodation = 0
+  const rejected: string[] = []
+  const applied = { add: 0, remove: 0, modify: 0, reorder: 0 }
+  const maxRemovals = options.maxRemovals ?? 2
+  const maxAdditions = options.maxAdditions ?? 4
+  const wanted = options.ids === undefined ? undefined : new Set(options.ids)
+  let added = 0
+  let removed = 0
 
-  for (const item of assimilation) {
-    const items = next[item.area]
-    const revised = item.revised.trim()
-    if (revised === '') {
-      skipped.push(`同化条目为空：${item.target}`)
+  for (const suggestion of suggestions) {
+    if (wanted !== undefined && !wanted.has(suggestion.id)) continue
+    const items = next[suggestion.area]
+    const label = SECTION_LABELS[suggestion.area]
+
+    if (suggestion.op === 'modify') {
+      const revised = (suggestion.value ?? '').trim()
+      const target = (suggestion.target ?? '').trim()
+      if (revised === '' || target === '') {
+        rejected.push(describe(suggestion.area, 'modify', `缺少 target 或 value：${suggestion.id}`))
+        continue
+      }
+      let index = findClosestIndex(items, target)
+      if (index < 0) index = findClosestIndex(items, revised)
+      if (index < 0) {
+        rejected.push(describe(suggestion.area, 'modify', `定位不到条目：${target}`))
+        continue
+      }
+      if (normalise(items[index] ?? '') === normalise(revised)) {
+        rejected.push(describe(suggestion.area, 'modify', `改后与原条目相同：${target}`))
+        continue
+      }
+      items[index] = revised
+      applied.modify += 1
       continue
     }
-    let index = findClosestIndex(items, item.target)
-    if (index < 0) index = findClosestIndex(items, item.revised)
-    if (index < 0) {
-      skipped.push(`同化找不到目标（${SECTION_LABELS[item.area]}）：${item.target}`)
+
+    if (suggestion.op === 'add') {
+      const text = (suggestion.value ?? '').trim()
+      if (text === '') {
+        rejected.push(describe(suggestion.area, 'add', `缺少 value：${suggestion.id}`))
+        continue
+      }
+      if (added >= maxAdditions) {
+        rejected.push(describe(suggestion.area, 'add', `超过单次新增上限 ${maxAdditions}：${text}`))
+        continue
+      }
+      if (items.some((existing) => normalise(existing) === normalise(text))) {
+        rejected.push(describe(suggestion.area, 'add', `条目已存在：${text}`))
+        continue
+      }
+      items.push(text)
+      added += 1
+      applied.add += 1
       continue
     }
-    const before = items[index] ?? ''
-    if (normalise(before) === normalise(revised)) {
-      skipped.push(`同化后与原条目相同，跳过：${before}`)
+
+    if (suggestion.op === 'remove') {
+      const target = (suggestion.target ?? '').trim()
+      if (target === '') {
+        rejected.push(describe(suggestion.area, 'remove', `缺少 target：${suggestion.id}`))
+        continue
+      }
+      const index = findClosestIndex(items, target)
+      if (index < 0) {
+        rejected.push(describe(suggestion.area, 'remove', `定位不到条目：${target}`))
+        continue
+      }
+      if (removed >= maxRemovals) {
+        rejected.push(describe(suggestion.area, 'remove', `超过单次删除上限 ${maxRemovals}：${target}`))
+        continue
+      }
+      if (items.length <= 1) {
+        rejected.push(describe(suggestion.area, 'remove', `拒绝删空该节：${target}`))
+        continue
+      }
+      items.splice(index, 1)
+      removed += 1
+      applied.remove += 1
       continue
     }
-    items[index] = revised
-    appliedAssimilation += 1
+
+    // reorder
+    const order = Array.isArray(suggestion.order)
+      ? suggestion.order.map((entry) => String(entry).trim()).filter((entry) => entry !== '')
+      : []
+    if (order.length < 2) {
+      rejected.push(describe(suggestion.area, 'reorder', `order 至少需要 2 条：${suggestion.id}`))
+      continue
+    }
+    const taken = new Set<number>()
+    const head: string[] = []
+    for (const entry of order) {
+      const index = findClosestIndex(items, entry)
+      if (index < 0 || taken.has(index)) {
+        rejected.push(describe(suggestion.area, 'reorder', `定位不到条目：${entry}`))
+        continue
+      }
+      taken.add(index)
+      head.push(items[index] as string)
+    }
+    if (taken.size < 2) {
+      rejected.push(describe(suggestion.area, 'reorder', '可匹配条目不足 2 条，放弃重排'))
+      continue
+    }
+    const rest = items.filter((_, index) => !taken.has(index))
+    const before = items.join('\u0000')
+    next[suggestion.area] = [...head, ...rest]
+    if (next[suggestion.area].join('\u0000') === before) {
+      rejected.push(describe(suggestion.area, 'reorder', '顺序未变化'))
+      continue
+    }
+    applied.reorder += 1
   }
 
-  for (const item of accommodation) {
-    const text = item.text.trim()
-    if (text === '') {
-      skipped.push('顺应条目为空')
-      continue
-    }
-    const items = next[item.area]
-    if (items.some((existing) => normalise(existing) === normalise(text))) {
-      skipped.push(`顺应条目已存在：${text}`)
-      continue
-    }
-    items.push(text)
-    appliedAccommodation += 1
-  }
-
-  void options
-  return { doc: next, applied: { assimilation: appliedAssimilation, accommodation: appliedAccommodation }, skipped }
+  return { doc: next, rendered: renderSchemaDoc(next), applied, rejected }
 }

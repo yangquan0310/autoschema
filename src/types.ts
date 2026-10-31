@@ -62,58 +62,82 @@ export interface Disequilibrium {
   evidence: Evidence[]
 }
 
-/** 一条同化：修订已有要点。 */
-export interface AssimilationItem {
-  area: Section
-  /** 现有要点原文（用于定位）。 */
-  target: string
-  /** 修订后的要点。 */
-  revised: string
-  why: string
-  evidence: Evidence[]
-}
+/**
+ * 一条建议的操作类型。
+ *
+ * - `add`    增：在该节末尾新增一条要点（`value` 为新增文本）
+ * - `remove` 删：删除某条现有要点（`target` 定位，`value` 省略）
+ * - `modify` 改：改写某条现有要点（`target` + `value`）
+ * - `reorder` 重排：给出该节的新顺序（`order`），**价值观的优先级只能靠它表达**
+ */
+export type SuggestionOp = 'add' | 'remove' | 'modify' | 'reorder'
+
+/** 这条建议在图式理论上属于哪一类变化（便于 agent 判断力度）。 */
+export type PiagetClass = 'assimilation' | 'accommodation'
 
 /**
- * 顺应（accommodation）的三种操作形态：图式**结构**的变化。
+ * 一条建议 —— 只描述"如果要改，应该怎么改"，不执行。
  *
- * - `add`：新增要点（原来那种）
- * - `remove`：删除要点——它同样是顺应，因为图式的条目集合变了
- * - `reorder`：调整顺序——`价值观` 的本质就是排序，不重排等于没更新
+ * 是否采纳、采纳哪几条，由调用方（agent / 人）决定。
  */
-export type AccommodationOp = 'add' | 'remove' | 'reorder'
-
-/** 一条顺应。字段按 `op` 取用：add→text；remove→target；reorder→order。 */
-export interface AccommodationItem {
-  op: AccommodationOp
+export interface Suggestion {
+  /** 稳定短 id，便于 `apply --ids s1,s3` 精确采纳。 */
+  id: string
   area: Section
-  /** add：新增的一句话要点。 */
-  text?: string
-  /** remove：要删除的现有要点原文（需能在该节定位）。 */
+  op: SuggestionOp
+  /** remove / modify / reorder 必填：现有条目原文（应用时会做就近匹配定位）。 */
   target?: string
-  /** reorder：该节重新排序后的条目原文列表（顺序即优先级）。 */
+  /** add / modify 必填：建议写入的文本。 */
+  value?: string
+  /** reorder 必填：该节重新排序后的条目原文列表，顺序即优先级。 */
   order?: string[]
-  why: string
+  /** reorder/add 之外的"改前"原文，便于 diff 展示。 */
+  before?: string
+  /** 应用后的预期结果（reorder 时是排序后的完整列表）。 */
+  after?: string
+  /** 皮亚杰分类：同化（改措辞）还是顺应（结构变化：增/删/重排）。 */
+  piaget: PiagetClass
+  /** 为什么这么改：非平衡在哪儿、证据指向什么。 */
+  reason: string
+  evidence: Evidence[]
+  /** 0~1，模型对这条建议的把握。 */
+  confidence: number
+  severity: 'low' | 'medium' | 'high'
+  /** 写回后可能的副作用（让人/agent 有心理准备）。 */
+  risk?: string
+}
+
+/** 一条观察到的非平衡（冲突本身，不是改法）。 */
+export interface Observation {
+  area: Section
+  /** 日记里我实际的行为（具体情境）。 */
+  observed: string
+  /** 与哪条现有要点冲突；该节为空时写「（该节为空）」。 */
+  against: string
+  /** 为什么这构成张力。 */
+  conflict: string
+  severity: 'low' | 'medium' | 'high'
   evidence: Evidence[]
 }
 
-/** DeepSeek 返回的分析结果。 */
+/** DeepSeek 返回的分析结果：观察 + 建议（建议不落地）。 */
 export interface Analysis {
   /** 0~1，越高表示图式与经验越自洽。 */
   equilibriumScore: number
   summary: string
-  disequilibrium: Disequilibrium[]
-  assimilation: AssimilationItem[]
-  accommodation: AccommodationItem[]
+  observations: Observation[]
+  suggestions: Suggestion[]
   notes: string
 }
 
-/** 应用变更后的结果。 */
+/** 采纳建议后的结果（只由显式的 apply 产生）。 */
 export interface ApplyResult {
   changed: boolean
   doc: SchemaDoc
   rendered: string
-  applied: { assimilation: number; accommodation: number }
-  skipped: string[]
+  applied: { add: number; remove: number; modify: number; reorder: number }
+  /** 未被采纳或无法定位的建议及原因。 */
+  rejected: string[]
   snapshot?: string
 }
 
@@ -158,13 +182,24 @@ export interface TriggerConfig {
   cooldownMs: number
   /** 至少有多少篇"未消化"日记才值得跑。 */
   minNewDiaries: number
-  /** 自动模式下的写回策略：propose=只出建议（默认），apply=直接写回。 */
-  applyMode: 'propose' | 'apply'
-  /** 安全阀：单次写回最多删几条、最多加几条。 */
+  /**
+   * 自动触发（schedule / hook）永远只产出建议，不写 AGENTS.md——
+   * 决定权在 agent。这里只控制建议里允许出现多少条删除/新增（防止一次提一堆）。
+   */
   maxRemovals: number
   maxAdditions: number
   schedule: ScheduleTriggerConfig
   hook: HookTriggerConfig
+}
+
+/** 日记来源：可直接指向一个或多个"事件目录"（不必是 AutoBioMemory 的数据根）。 */
+export interface DiariesConfig {
+  /** 事件目录列表；支持 `~` 与相对路径（相对 cwd）。为空时回落到 `<memoryRoot>/events`。 */
+  dirs: string[]
+  /** 认为哪些文件是一个事件（默认 *.json + 同名 .md）。 */
+  includeGlobs: string[]
+  /** 只读这些目录，不在别处找（默认 false：还会回落 memoryRoot/events）。 */
+  strict: boolean
 }
 
 export interface DigestConfig {
@@ -203,8 +238,10 @@ export interface AutoSchemaConfig {
   version: number
   /** AGENTS.md 路径（默认 ~/.dsh/AGENTS.md）。 */
   agentsFile: string
-  /** AutoBioMemory 数据根（默认 ~/.autobiomemory）。 */
+  /** AutoBioMemory 数据根（默认 ~/.autobiomemory）；`diaries.dirs` 为空时用它下面的 events/。 */
   memoryRoot: string
+  /** 日记位置（可多个目录，显式配置）。 */
+  diaries: DiariesConfig
   /** 总结时取多少篇最近日记。 */
   diaryLimit: number
   /** 只取该时间点之后的日记（ISO，可空）。 */

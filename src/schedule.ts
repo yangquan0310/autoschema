@@ -9,7 +9,7 @@
  */
 
 import { countUndigested, loadCursor, msSinceLastRun, saveCursor } from './cursor.js'
-import { listEventIds } from './diaries.js'
+import { listEventIds, resolveDiaryDirs } from './diaries.js'
 import { nowIso } from './util.js'
 import type { AutoSchemaConfig } from './types.js'
 
@@ -41,7 +41,7 @@ export function nextAtTime(now: Date, atTime: string): number | undefined {
  */
 export function checkDue(config: AutoSchemaConfig, now = new Date()): DueCheck {
   const cursor = loadCursor(config.stateRoot)
-  const undigested = countUndigested(cursor, listEventIds(config.memoryRoot))
+  const undigested = countUndigested(cursor, listEventIds(resolveDiaryDirs(config)))
   if (!config.trigger.modes.includes('schedule')) {
     return {
       due: false,
@@ -120,7 +120,7 @@ export function checkHookDue(config: AutoSchemaConfig, now = new Date()): DueChe
   }
   const events = config.trigger.hook.events
   const cursor = loadCursor(config.stateRoot)
-  const undigested = countUndigested(cursor, listEventIds(config.memoryRoot))
+  const undigested = countUndigested(cursor, listEventIds(resolveDiaryDirs(config)))
   if (events.length === 0) {
     return {
       due: false,

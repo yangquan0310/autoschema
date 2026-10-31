@@ -6,7 +6,7 @@
  */
 
 import { checkDue, checkHookDue, recordSkip, type DueCheck } from './schedule.js'
-import { readSchema, run } from './reconcile.js'
+import { propose, readSchema } from './reconcile.js'
 import { loadCursor, saveCursor } from './cursor.js'
 import { createLogger, nowIso } from './util.js'
 import { SECTION_LABELS } from './types.js'
@@ -27,25 +27,23 @@ export interface TickResult {
   ran: boolean
   due?: DueCheck
   result?: RunResult
-  /** 落盘还是仅出建议。 */
-  mode: 'applied' | 'proposed' | 'skipped'
+  /** 只出建议（proposed）｜无建议（clean）｜被闸门跳过（skipped）。 */
+  mode: 'proposed' | 'clean' | 'skipped'
   message: string
 }
 
+/** 自动触发只产建议：摘要里说清条数与操作分布，不说"已写回"。 */
 function describe(result: RunResult): string {
-  const parts = [
+  const ops = result.analysis.suggestions.map((s) => s.op)
+  const count = (op: string): number => ops.filter((entry) => entry === op).length
+  return [
     `平衡度 ${Math.round(result.analysis.equilibriumScore * 100)}%`,
-    `非平衡 ${result.analysis.disequilibrium.length}`,
-    `同化 ${result.applied.assimilation}/${result.analysis.assimilation.length}`,
-    `顺应 ${result.applied.accommodation}/${result.analysis.accommodation.length}`,
-  ]
-  const sections = (['style', 'belief', 'value'] as const)
-    .map((section) => `${SECTION_LABELS[section]}${result.after[section].length}`)
-    .join(' ')
-  return `${parts.join(' · ')}（图式：${sections}）`
+    `非平衡 ${result.analysis.observations.length}`,
+    `建议 ${result.analysis.suggestions.length}（增 ${count('add')} 删 ${count('remove')} 改 ${count('modify')} 重排 ${count('reorder')}）`,
+  ].join(' · ')
 }
 
-/** 跑一次（受闸门约束，除非 origin=manual）。 */
+/** 跑一次（受闸门约束，除非 origin=manual）。**产出建议，从不改 AGENTS.md。** */
 export async function tick(options: TickOptions): Promise<TickResult> {
   const logger = options.logger ?? createLogger()
   const { config } = options
@@ -61,23 +59,20 @@ export async function tick(options: TickOptions): Promise<TickResult> {
     return { ran: false, due: checkDue(config), mode: 'skipped', message: 'manual dry-check' }
   }
 
-  const applyNow = options.origin === 'manual' ? false : config.trigger.applyMode === 'apply'
-  const result = await run({
+  const result = await propose({
     config,
     logger,
-    dryRun: !applyNow,
     ...(options.client === undefined ? {} : { client: options.client }),
     runId: nowIso(),
   })
 
-  const mode = result.wrote ? 'applied' : 'proposed'
+  const mode = result.pendingSaved ? 'proposed' : 'clean'
   const message = describe(result)
-  if (result.wrote) logger.info(`已写回 AGENTS.md：${message}`)
-  else logger.info(`建议已就绪（待落盘）：${message}`)
+  logger.info(`${result.pendingSaved ? '建议已就绪（未写回）' : '图式与经验基本自洽'}：${message}`)
   return { ran: true, result, mode, message }
 }
 
-/** 供 hook 使用：把最近的运行时间写进游标，避免同一生命周期点连跑。 */
+/** 供 hook 使用：把最近运行时间写进游标，避免同一生命周期点连跑。 */
 export function touchRun(config: AutoSchemaConfig): void {
   const cursor = loadCursor(config.stateRoot)
   saveCursor(config.stateRoot, { ...cursor, lastRunAt: nowIso(), skippedRuns: 0 })
