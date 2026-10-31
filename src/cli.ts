@@ -14,6 +14,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 
 import { loadConfig, ensureConfigFile, validateConfig, resolveApiKey, configFile } from './config.js'
+import { VERSION } from './constants.js'
 import { DeepseekError } from './deepseek.js'
 import { listEventIds, resolveDiaryDirs } from './diaries.js'
 import { DeepseekClient } from './deepseek.js'
@@ -74,7 +75,7 @@ const num = (args: Args, key: string): number | undefined => {
 const bool = (args: Args, key: string): boolean => args.flags.has(key)
 
 function help(): void {
-  process.stdout.write(`AutoSchema 0.3.3 — 让自我图式随日记演化（皮亚杰：非平衡 → 同化/顺应 → 平衡）
+  process.stdout.write(`AutoSchema ${VERSION} — 让自我图式随日记演化（皮亚杰：非平衡 → 同化/顺应 → 平衡）
 
 用法：autoschema <command> [options]
 
@@ -110,7 +111,7 @@ async function main(): Promise<number> {
     return 0
   }
   if (args.command === '--version' || args.command === 'version') {
-    process.stdout.write('AutoSchema 0.3.3\n')
+    process.stdout.write(`AutoSchema ${VERSION}\n`)
     return 0
   }
 

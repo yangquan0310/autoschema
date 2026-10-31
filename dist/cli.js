@@ -11,6 +11,7 @@ import os2 from "os";
 // src/constants.ts
 import os from "os";
 import path from "path";
+var VERSION = "0.3.4";
 var DEFAULT_AGENTS_FILE = path.join(os.homedir(), ".dsh", "AGENTS.md");
 var DEFAULT_MEMORY_ROOT = path.join(os.homedir(), ".autobiomemory");
 var DEFAULT_STATE_ROOT = path.join(os.homedir(), ".autoschema");
@@ -699,12 +700,12 @@ function applySuggestions(doc, suggestions, options = {}) {
 
 // src/cursor.ts
 import path5 from "path";
-var VERSION = 1;
+var VERSION2 = 1;
 function cursorFile(stateRoot) {
   return path5.join(stateRoot, "state", "cursor.json");
 }
 function emptyCursor() {
-  return { version: VERSION, digested: {}, proposed: {} };
+  return { version: VERSION2, digested: {}, proposed: {} };
 }
 function loadCursor(stateRoot) {
   const raw = readJsonFile(cursorFile(stateRoot));
@@ -714,14 +715,14 @@ function loadCursor(stateRoot) {
   return {
     ...emptyCursor(),
     ...raw,
-    version: VERSION,
+    version: VERSION2,
     digested: raw.digested ?? {},
     proposed: raw.proposed ?? {}
   };
 }
 function saveCursor(stateRoot, cursor) {
   ensureDir(path5.join(stateRoot, "state"));
-  writeJsonFile(cursorFile(stateRoot), { ...cursor, version: VERSION });
+  writeJsonFile(cursorFile(stateRoot), { ...cursor, version: VERSION2 });
 }
 function isDigested(cursor, eventId) {
   return cursor.digested[eventId] !== void 0;
@@ -1416,7 +1417,7 @@ var num = (args, key) => {
 };
 var bool = (args, key) => args.flags.has(key);
 function help() {
-  process.stdout.write(`AutoSchema 0.3.3 \u2014 \u8BA9\u81EA\u6211\u56FE\u5F0F\u968F\u65E5\u8BB0\u6F14\u5316\uFF08\u76AE\u4E9A\u6770\uFF1A\u975E\u5E73\u8861 \u2192 \u540C\u5316/\u987A\u5E94 \u2192 \u5E73\u8861\uFF09
+  process.stdout.write(`AutoSchema ${VERSION} \u2014 \u8BA9\u81EA\u6211\u56FE\u5F0F\u968F\u65E5\u8BB0\u6F14\u5316\uFF08\u76AE\u4E9A\u6770\uFF1A\u975E\u5E73\u8861 \u2192 \u540C\u5316/\u987A\u5E94 \u2192 \u5E73\u8861\uFF09
 
 \u7528\u6CD5\uFF1Aautoschema <command> [options]
 
@@ -1450,7 +1451,8 @@ async function main() {
     return 0;
   }
   if (args.command === "--version" || args.command === "version") {
-    process.stdout.write("AutoSchema 0.3.3\n");
+    process.stdout.write(`AutoSchema ${VERSION}
+`);
     return 0;
   }
   const config = loadConfig({
