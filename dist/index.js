@@ -8,7 +8,7 @@ var SECTION_LABELS = {
 // src/constants.ts
 import os from "os";
 import path from "path";
-var VERSION = "0.3.2";
+var VERSION = "0.3.3";
 var DEFAULT_AGENTS_FILE = path.join(os.homedir(), ".dsh", "AGENTS.md");
 var DEFAULT_MEMORY_ROOT = path.join(os.homedir(), ".autobiomemory");
 var DEFAULT_STATE_ROOT = path.join(os.homedir(), ".autoschema");
@@ -529,9 +529,9 @@ function resolveDiaryDirs(config) {
   if (config.diaries?.strict === true) return [];
   return [eventsDir(config.memoryRoot)];
 }
-function findEventFile(dirs, name) {
+function findEventFile(dirs, name2) {
   for (const dir of dirs) {
-    const file = path4.join(dir, name);
+    const file = path4.join(dir, name2);
     if (fs2.existsSync(file)) return file;
   }
   return void 0;
@@ -546,9 +546,9 @@ function listEventIds(eventsDirOrDirs) {
     } catch {
       continue;
     }
-    for (const name of names) {
-      if (!name.endsWith(".json") || name.startsWith("_")) continue;
-      ids.add(name.slice(0, -".json".length));
+    for (const name2 of names) {
+      if (!name2.endsWith(".json") || name2.startsWith("_")) continue;
+      ids.add(name2.slice(0, -".json".length));
     }
   }
   return [...ids];
@@ -570,7 +570,7 @@ function readDiary(eventsDirOrDirs, eventId) {
     title: structured.title ?? "(\u65E0\u6807\u9898)",
     status: structured.outcome?.status ?? "ongoing",
     tags: Array.isArray(structured.tags) ? structured.tags.filter((t) => typeof t === "string") : [],
-    people: Array.isArray(structured.people) ? structured.people.map((p) => p?.name ?? "").filter((name) => name !== "") : [],
+    people: Array.isArray(structured.people) ? structured.people.map((p) => p?.name ?? "").filter((name2) => name2 !== "") : [],
     diary
   };
 }
@@ -1413,14 +1413,102 @@ function touchRun(config) {
   const cursor = loadCursor(config.stateRoot);
   saveCursor(config.stateRoot, { ...cursor, lastRunAt: nowIso(), skippedRuns: 0 });
 }
+
+// src/plugin.ts
+import z from "@deepseek-ai/schemastery";
+var name = "autoschema";
+var inject = ["tools", "systemPrompt"];
+var Config = z.object({
+  stateRoot: z.string(),
+  agentsFile: z.string(),
+  memoryRoot: z.string(),
+  events: z.array(z.string()),
+  cooldownMs: z.natural(),
+  disabled: z.boolean().default(false)
+});
+function bridgeLogger(ctx) {
+  const base = ctx.logger(name);
+  const emit = (level, message) => {
+    try {
+      base[level]?.(`[${name}] ${message}`);
+    } catch {
+    }
+  };
+  return {
+    debug: (m) => emit("debug", m),
+    info: (m) => emit("info", m),
+    warn: (m) => emit("warn", m),
+    error: (m) => emit("error", m)
+  };
+}
+function apply(ctx, pluginConfig = {}) {
+  if (pluginConfig.disabled === true) return;
+  const config = loadConfig({
+    ...pluginConfig.stateRoot === void 0 ? {} : { stateRoot: pluginConfig.stateRoot },
+    patch: {
+      ...pluginConfig.agentsFile === void 0 ? {} : { agentsFile: pluginConfig.agentsFile },
+      ...pluginConfig.memoryRoot === void 0 ? {} : { memoryRoot: pluginConfig.memoryRoot },
+      ...pluginConfig.events === void 0 ? {} : { trigger: { hook: { events: pluginConfig.events } } },
+      ...pluginConfig.cooldownMs === void 0 ? {} : { trigger: { hook: { cooldownMs: pluginConfig.cooldownMs } } },
+      trigger: { modes: ["hook"] }
+    }
+  });
+  ensureConfigFile(config);
+  const logger = createLogger({ level: "warn" });
+  const cLogger = bridgeLogger(ctx);
+  const events = config.trigger.hook.events;
+  const fire = (label) => {
+    void (async () => {
+      try {
+        const result = await tick({ config, origin: "hook", logger });
+        if (result.ran) {
+          cLogger.info(`${label} \u2192 ${result.mode}\uFF1A${result.message}`);
+        } else {
+          cLogger.debug(`${label} \u8DF3\u8FC7\uFF1A${result.message}`);
+        }
+      } catch (error) {
+        cLogger.warn(`${label} \u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`);
+      }
+    })();
+  };
+  if (events.includes("compaction/start")) {
+    ctx.on("session/event", ((_session, event) => {
+      if (event?.type === "compaction/start") fire("compaction/start");
+    }));
+  }
+  if (events.includes("agent/pre-step")) {
+    ctx.on(
+      "agent/pre-step",
+      (async (_payload, next) => {
+        fire("agent/pre-step");
+        return next();
+      }),
+      { prepend: true }
+    );
+  }
+  if (events.includes("agent/idle")) {
+    ctx.on("agent/status", ((payload) => {
+      if (payload.status === "idle") fire("agent/idle");
+    }));
+  }
+  if (events.includes("session/start")) {
+    ctx.on("agent/created", (() => fire("session/start")));
+  }
+  cLogger.info(
+    `AutoSchema hook \u5DF2\u542F\u7528\uFF1A${events.join(", ")}\uFF08\u53EA\u4EA7\u51FA\u5EFA\u8BAE\uFF0C\u4E0D\u4FEE\u6539 AGENTS.md\uFF09`
+  );
+}
+var plugin_default = { name, inject, Config, apply };
 export {
   ANALYSIS_GUIDE,
   AnalysisError,
+  Config,
   DeepseekClient,
   DeepseekError,
   RESPONSE_CONTRACT,
   SECTION_LABELS,
   VERSION,
+  apply,
   applyPending,
   applySelected,
   applySuggestions,
@@ -1435,6 +1523,7 @@ export {
   createLogger,
   cronLine,
   cursorFile,
+  plugin_default as default,
   defaultConfig,
   emptyCursor,
   ensureConfigFile,
@@ -1443,6 +1532,7 @@ export {
   filterUndigested,
   findClosestIndex,
   gatherDiaries,
+  inject,
   isDigested,
   isPending,
   isSettled,
@@ -1456,6 +1546,7 @@ export {
   markProposed,
   markRun,
   msSinceLastRun,
+  name,
   nextAtTime,
   normalizeAnalysis,
   parseAnalysisResponse,

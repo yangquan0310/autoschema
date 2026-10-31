@@ -1416,7 +1416,7 @@ var num = (args, key) => {
 };
 var bool = (args, key) => args.flags.has(key);
 function help() {
-  process.stdout.write(`AutoSchema 0.3.2 \u2014 \u8BA9\u81EA\u6211\u56FE\u5F0F\u968F\u65E5\u8BB0\u6F14\u5316\uFF08\u76AE\u4E9A\u6770\uFF1A\u975E\u5E73\u8861 \u2192 \u540C\u5316/\u987A\u5E94 \u2192 \u5E73\u8861\uFF09
+  process.stdout.write(`AutoSchema 0.3.3 \u2014 \u8BA9\u81EA\u6211\u56FE\u5F0F\u968F\u65E5\u8BB0\u6F14\u5316\uFF08\u76AE\u4E9A\u6770\uFF1A\u975E\u5E73\u8861 \u2192 \u540C\u5316/\u987A\u5E94 \u2192 \u5E73\u8861\uFF09
 
 \u7528\u6CD5\uFF1Aautoschema <command> [options]
 
@@ -1450,7 +1450,7 @@ async function main() {
     return 0;
   }
   if (args.command === "--version" || args.command === "version") {
-    process.stdout.write("AutoSchema 0.3.2\n");
+    process.stdout.write("AutoSchema 0.3.3\n");
     return 0;
   }
   const config = loadConfig({

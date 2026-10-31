@@ -24,7 +24,7 @@ const copy = (name) => {
   fs.cpSync(src, dst)
 }
 for (const entry of fs.readdirSync(distDir)) {
-  if (/^(index|cli|chunk-[\w-]+)\.(js|d\.ts)$/u.test(entry)) copy(entry)
+  if (/^(index|cli|plugin|chunk-[\w-]+)\.(js|d\.ts)$/u.test(entry)) copy(entry)
 }
 for (const entry of ['README.md', 'LICENSE', 'cordis.patch.yml']) {
   const src = path.join(repo, entry)
@@ -40,13 +40,21 @@ fs.writeFileSync(
       type: 'module',
       main: 'index.js',
       types: 'index.d.ts',
-      exports: { '.': { types: './index.d.ts', default: './index.js' }, './cli': { types: './cli.d.ts', default: './cli.js' } },
+      exports: {
+        '.': { types: './index.d.ts', default: './index.js' },
+        './cli': { types: './cli.d.ts', default: './cli.js' },
+        './plugin': { types: './plugin.d.ts', default: './plugin.js' },
+      },
+      dependencies: rootPkg.dependencies ?? {},
+      peerDependencies: rootPkg.peerDependencies ?? {},
       bin: { autoschema: './cli.js' },
       files: [
         'index.js',
         'index.d.ts',
         'cli.js',
         'cli.d.ts',
+        'plugin.js',
+        'plugin.d.ts',
         'chunk-*.js',
         'cordis.patch.yml',
         'README.md',

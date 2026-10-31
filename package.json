@@ -1,6 +1,6 @@
 {
   "name": "autoschema",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "AutoSchema — 让 agent 的自我图式（风格/信念/价值观）随日记演化：皮亚杰式的非平衡 → 同化 / 顺应 → 平衡",
   "type": "module",
   "main": "dist/index.js",
@@ -13,6 +13,10 @@
     "./cli": {
       "types": "./dist/cli.d.ts",
       "default": "./dist/cli.js"
+    },
+    "./plugin": {
+      "types": "./dist/plugin.d.ts",
+      "default": "./dist/plugin.js"
     }
   },
   "bin": {
@@ -68,5 +72,8 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
+  },
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.1"
   }
 }

@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.3] — 2026-10-31
+
+### Fixed（会挡住 dsh 启动的严重问题）
+
+- **`dsh --profile web` 启动失败：`invalid plugin, expect function or object with an "apply" method, received object`。**
+  原因：`cordis.patch.yml` 用 `name: autoschema` 指向**包主入口** `dist/index.js`，而插件实体（`name`/`inject`/`Config`/`apply`）
+  只在 `dist/plugin.js` 里，主入口没有 `apply`，cordis 于是判定"不是插件"。
+  修法：主入口重新导出插件面（`apply` / `inject` / `Config` / `name` / default），并补 `./plugin` 子路径导出；
+  `scripts/pack-dist.mjs` 也会把 `plugin.js` / `plugin.d.ts` 打进包，并把 `@deepseek-ai/schemastery`
+  声明为运行时依赖（插件加载它时需要）。
+- 打包产物校验：解包后 `import('package/index.js')` → `apply: function`、`inject: ['tools','systemPrompt']`、
+  `default.apply: function`；临时 profile 实测 `dsh.profile.bundles` 含 `autoschema`。
+
 ## [0.3.2] — 2026-10-31
 
 ### Fixed（打包）
