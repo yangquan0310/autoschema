@@ -52,6 +52,10 @@ export function truncate(text: string, max: number): string {
   return `${text.slice(0, Math.max(0, max - 1))}…`
 }
 
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
 export function clamp(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return min
   return Math.min(max, Math.max(min, value))
