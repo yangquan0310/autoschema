@@ -11,9 +11,28 @@ const distDir = path.join(repo, 'dist')
 const pkgDir = path.join(distDir, 'package')
 const rootPkg = JSON.parse(fs.readFileSync(path.join(repo, 'package.json'), 'utf8'))
 
+// Windows 上 pnpm 是 .cmd shim，Node 无法直接 execFileSync('pnpm', ...)（spawnSync pnpm ENOENT），
+// 必须交给 cmd.exe 解析；Unix 下仍直接 exec pnpm。
+function packWithPnpm() {
+  const options = { cwd: pkgDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] }
+  const args = ['pack', '--pack-destination', distDir]
+  if (process.platform !== 'win32') return execFileSync('pnpm', args, options)
+  const quoted = args.map((arg) => (arg.includes(' ') ? `"${arg}"` : arg)).join(' ')
+  return execFileSync(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', `pnpm ${quoted}`], options)
+}
+
 if (!fs.existsSync(path.join(distDir, 'index.js'))) {
   console.error('dist/index.js 不存在，先跑 pnpm run build')
   process.exit(1)
+}
+// dist/ 会提交，dist/cli.js 是 bin 入口；CRLF 的 shebang 会让 Unix 安装失败。
+for (const file of ['index.js', 'cli.js']) {
+  const target = path.join(distDir, file)
+  if (!fs.existsSync(target)) continue
+  if (fs.readFileSync(target, 'utf8').includes('\r\n')) {
+    console.error(`dist/${file} 含 CRLF 换行；先用 LF 重新检出再打包`)
+    process.exit(1)
+  }
 }
 fs.mkdirSync(pkgDir, { recursive: true })
 const copy = (name) => {
@@ -69,7 +88,7 @@ fs.writeFileSync(
     2,
   )}\n`,
 )
-const out = execFileSync('pnpm', ['pack', '--pack-destination', distDir], { cwd: pkgDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] })
+const out = packWithPnpm()
 const last = out.trim().split('\n').pop() ?? ''
 const tarball = path.isAbsolute(last) ? last : path.join(distDir, last)
 console.log(`dist/package ready: ${pkgDir}`)
