@@ -1,0 +1,10 @@
+# 工作区在 Windows 上也检出为 LF。dist/ 会提交且 dist/cli.js 是 bin 入口，
+# CRLF 的 shebang 会让 Unix 安装报 bad interpreter。
+* text=auto eol=lf
+
+*.zstd binary
+*.tgz  binary
+*.sqlite binary
+*.png  binary
+*.jpg  binary
+*.ico  binary
