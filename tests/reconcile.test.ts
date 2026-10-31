@@ -224,7 +224,8 @@ describe('日记位置可配置', () => {
     const config = loadConfig({
       patch: { diaries: { dirs: ['~/events-a', '~/events-a', '/abs/events-b'] } } as never,
     })
-    expect(config.diaries.dirs).toEqual([path.join(os.homedir(), 'events-a'), '/abs/events-b'])
+    // /abs 是 POSIX 写法；在 Windows 上 path.resolve 会补上当前盘符，所以期望值也用 resolve 算。
+    expect(config.diaries.dirs).toEqual([path.join(os.homedir(), 'events-a'), path.resolve('/abs/events-b')])
   })
 
   it('strict mode refuses to fall back', () => {

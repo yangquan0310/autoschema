@@ -1,0 +1,11 @@
+# pnpm 11 把构建脚本审批移到 workspace 配置；esbuild（tsup/vitest 依赖）
+# 需要 postinstall 才能放置平台二进制。
+allowBuilds:
+  esbuild: true
+
+# pnpm 11 默认 minimumReleaseAge=1440（24h），且不只在解析时生效：每次 install 与
+# `pnpm run` 前的依赖校验都会重新检查 lockfile 里每个条目的发布时间。本仓库的
+# lockfile 由唯一维护者提交、随发布一起审查，发布当天必须能安装刚锁定不到 24h 的
+# 依赖（如 rollup 4.67.2），因此关掉这层时间闸门。
+minimumReleaseAge: 0
+
