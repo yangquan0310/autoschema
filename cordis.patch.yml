@@ -1,0 +1,21 @@
+# AutoSchema — profile patch layer（hook 触发）。
+#
+# 只在 profile 的 bundles 里加入本包时才生效；关闭方式：
+#   - id: autoschema
+#     config:
+#       disabled: true
+- insert:
+    - id: autoschema
+      name: autoschema
+      config:
+        # 状态根（config.json / cursor / history / pending）
+        stateRoot: !!js process.env.DSH_AUTOSCHEMA_ROOT ?? undefined
+        # 被维护的自我图式
+        agentsFile: !!js process.env.DSH_AUTOSCHEMA_AGENTS ?? undefined
+        # 经验来源（AutoBioMemory 数据根）
+        memoryRoot: !!js process.env.DSH_AUTOBIO_ROOT ?? undefined
+        # 挂哪些特定生命周期点；默认只挂压缩开始（最克制）
+        events: !!js process.env.DSH_AUTOSCHEMA_HOOKS ? JSON.parse(process.env.DSH_AUTOSCHEMA_HOOKS) : ['compaction/start']
+        # hook 冷却（毫秒）
+        cooldownMs: !!js process.env.DSH_AUTOSCHEMA_COOLDOWN ? Number(process.env.DSH_AUTOSCHEMA_COOLDOWN) : 1800000
+        disabled: false

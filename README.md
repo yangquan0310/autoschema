@@ -32,6 +32,31 @@ node dist/cli.js history           # 历次快照
 只依赖 `~/.dsh/AGENTS.md` 与 `~/.autobiomemory/events/`，不引入任何运行时依赖
 （Node 内置 `fetch` 直连 DeepSeek）。
 
+## 什么时候跑（触发方式）
+
+三种可同时开启，配置在 `~/.autoschema/config.json` 的 `trigger`：
+
+```jsonc
+"trigger": {
+  "modes": ["manual", "schedule", "hook"],
+  "cooldownMs": 3600000,        // 共用冷却
+  "minNewDiaries": 5,           // 未消化日记不足 5 篇就不跑
+  "applyMode": "propose",       // propose=只出建议；apply=自动写回
+  "schedule": { "intervalMinutes": 1440, "atTime": "03:30", "skipIfOverdueMinutes": 720 },
+  "hook":     { "events": ["compaction/start"], "cooldownMs": 1800000 }
+}
+```
+
+| 方式 | 用法 | 说明 |
+| --- | --- | --- |
+| `manual` | `autoschema analyze` / `apply` | 永远可用，忽略闸门 |
+| `schedule` | `autoschema tick`（cron/timer）· `autoschema daemon --interval 300` · `autoschema cron` | `tick` 幂等：冷却 + 未消化数量都满足才真正跑 |
+| `hook` | 装成 dsh 插件（`cordis.patch.yml`） | 只挂**特定**生命周期点：`compaction/start`（默认）、`agent/pre-step`、`agent/idle`、`session/start` |
+
+**只跑未消化的日记**：`state/cursor.json` 记 `digested`（已吸收）与 `proposed`（已建议未落盘），
+定时/hook 都只喂"两者都没有"的日记；`analyze` 的产出存 `state/pending.json`，
+`apply` 直接消费它、**不再二次调用模型**。
+
 ## 它怎么判断
 
 | 概念 | 在本项目里的含义 |

@@ -13,9 +13,13 @@
 import path from 'node:path'
 
 import { loadConfig, ensureConfigFile, validateConfig, resolveApiKey, configFile } from './config.js'
+import { DeepseekError } from './deepseek.js'
 import { listEventIds } from './diaries.js'
 import { DeepseekClient } from './deepseek.js'
-import { listHistory, readSchema, renderReport, run } from './reconcile.js'
+import { applyProposal, clearPending, listHistory, loadPending, readSchema, renderReport, run } from './reconcile.js'
+import { checkDue, cronLine } from './schedule.js'
+import { loadCursor, pendingEventIds, resetCursor } from './cursor.js'
+import { tick } from './tick.js'
 import { renderSchemaDoc } from './agents-md.js'
 import { createLogger, ensureDir, maskSecret } from './util.js'
 import { SECTION_LABELS } from './types.js'
@@ -59,13 +63,19 @@ const num = (args: Args, key: string): number | undefined => {
 const bool = (args: Args, key: string): boolean => args.flags.has(key)
 
 function help(): void {
-  process.stdout.write(`AutoSchema 0.1.0 — 让自我图式随日记演化（皮亚杰：非平衡 → 同化/顺应 → 平衡）
+  process.stdout.write(`AutoSchema 0.2.0 — 让自我图式随日记演化（皮亚杰：非平衡 → 同化/顺应 → 平衡）
 
 用法：autoschema <command> [options]
 
 命令：
-  analyze      分析并打印建议（不写回）；--limit N --since ISO --json
-  apply        分析并写回 AGENTS.md（先快照到状态根 history/）
+  analyze      分析并打印建议（不写回）；--limit N --since ISO --all --json
+  apply        落盘待审建议（若有 pending 则不再调模型）；--re-analyze 强制重算
+  tick         供 cron/timer 调用：按闸门判断该不该跑，该跑才跑
+  daemon       内置循环：每 N 秒检查一次闸门（默认 60s）
+  cron         打印建议的 crontab 行
+  due          只检查"现在该不该跑"，不执行
+  pending      查看待落盘建议的摘要
+  reset-cursor 清空消化游标（让所有日记重新参与分析）
   show         打印当前图式（风格/信念/价值观）
   history      列出历次快照
   init         创建状态目录与默认 config.json
@@ -88,7 +98,7 @@ async function main(): Promise<number> {
     return 0
   }
   if (args.command === '--version' || args.command === 'version') {
-    process.stdout.write('AutoSchema 0.1.0\n')
+    process.stdout.write('AutoSchema 0.2.0\n')
     return 0
   }
 
@@ -138,8 +148,7 @@ async function main(): Promise<number> {
       return 0
     }
 
-    case 'analyze':
-    case 'apply': {
+    case 'analyze': {
       const problems = validateConfig(config)
       if (problems.length > 0) {
         process.stderr.write(`配置有问题：\n${problems.map((p) => `  - ${p}`).join('\n')}\n`)
@@ -148,12 +157,128 @@ async function main(): Promise<number> {
       const result = await run({
         config,
         logger,
-        dryRun: args.command !== 'apply',
+        dryRun: true,
+        onlyUndigested: bool(args, 'all') ? false : undefined,
         ...(num(args, 'limit') === undefined ? {} : { limit: num(args, 'limit') as number }),
         ...(str(args, 'since') === undefined ? {} : { since: str(args, 'since') as string }),
       })
       if (bool(args, 'json')) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`)
       else process.stdout.write(`${renderReport(result)}\n`)
+      return 0
+    }
+
+    case 'apply': {
+      const problems = validateConfig(config)
+      if (problems.length > 0) {
+        process.stderr.write(`配置有问题：\n${problems.map((p) => `  - ${p}`).join('\n')}\n`)
+        return 2
+      }
+      const pending = loadPending(config)
+      if (pending !== undefined && !bool(args, 're-analyze')) {
+        const applied = applyProposal(config, pending)
+        process.stdout.write(
+          [
+            `已落盘 pending 建议（${pending.at}）：同化 ${applied.applied.assimilation} · 顺应 ${applied.applied.accommodation}`,
+            ...applied.skipped.map((reason) => `  跳过：${reason}`),
+            applied.snapshot === undefined ? '（无变更，未写文件）' : `快照：${applied.snapshot}`,
+            `已写回：${config.agentsFile}`,
+          ].join('\n') + '\n',
+        )
+        return 0
+      }
+      const result = await run({
+        config,
+        logger,
+        dryRun: false,
+        ...(num(args, 'limit') === undefined ? {} : { limit: num(args, 'limit') as number }),
+        ...(str(args, 'since') === undefined ? {} : { since: str(args, 'since') as string }),
+      })
+      if (bool(args, 'json')) process.stdout.write(`${JSON.stringify(result, null, 2)}\n`)
+      else process.stdout.write(`${renderReport(result)}\n`)
+      return 0
+    }
+
+    case 'due': {
+      const due = checkDue(config)
+      process.stdout.write(
+        `${due.due ? '该跑' : '不该跑'}：${due.reason}｜未消化 ${due.undigested} 篇` +
+          (due.waitMs > 0 && due.waitMs !== Number.POSITIVE_INFINITY
+            ? `｜还需 ${Math.ceil(due.waitMs / 60_000)} 分钟`
+            : '') +
+          '\n',
+      )
+      return 0
+    }
+
+    case 'tick': {
+      const outcome = await tick({ config, origin: 'schedule', logger })
+      process.stdout.write(`${outcome.ran ? '已运行' : '已跳过'}：${outcome.message}\n`)
+      return 0
+    }
+
+    case 'daemon': {
+      const intervalSec = Math.max(5, num(args, 'interval') ?? 60)
+      process.stdout.write(`AutoSchema daemon 启动：每 ${intervalSec}s 检查一次闸门（Ctrl-C 退出）\n`)
+      let stopping = false
+      process.on('SIGINT', () => {
+        stopping = true
+        process.stdout.write('\n收到 SIGINT，退出。\n')
+      })
+      while (!stopping) {
+        const due = checkDue(config)
+        if (due.due) {
+          try {
+            const outcome = await tick({ config, origin: 'schedule', logger })
+            process.stdout.write(`${new Date().toISOString()} 运行：${outcome.mode} ${outcome.message}\n`)
+          } catch (error) {
+            process.stderr.write(`${new Date().toISOString()} 运行失败：${error instanceof Error ? error.message : String(error)}\n`)
+          }
+        } else {
+          process.stdout.write(`${new Date().toISOString()} 跳过：${due.reason}\n`)
+        }
+        await new Promise((resolve) => setTimeout(resolve, intervalSec * 1000))
+      }
+      return 0
+    }
+
+    case 'cron': {
+      process.stdout.write(
+        [
+          '# 把下面一行加到 crontab -e（tick 自带闸门，重复调用安全）：',
+          cronLine(config),
+          '',
+          '# 或者用 systemd timer 调 tick；也可以 `autoschema daemon --interval 300` 常驻。',
+        ].join('\n') + '\n',
+      )
+      return 0
+    }
+
+    case 'pending': {
+      const pending = loadPending(config)
+      if (pending === undefined) {
+        process.stdout.write('没有待落盘建议。\n')
+        return 0
+      }
+      process.stdout.write(
+        [
+          `待落盘建议：${pending.at}（批次 ${pending.runId}）`,
+          `  非平衡 ${pending.analysis.disequilibrium.length} · 同化 ${pending.analysis.assimilation.length} · 顺应 ${pending.analysis.accommodation.length}`,
+          `  涉及日记 ${pending.eventIds.length} 篇`,
+          `  落盘：autoschema apply`,
+          `  丢弃：autoschema apply --discard`,
+        ].join('\n') + '\n',
+      )
+      if (bool(args, 'discard')) {
+        clearPending(config)
+        process.stdout.write('已丢弃待落盘建议。\n')
+      }
+      return 0
+    }
+
+    case 'reset-cursor': {
+      resetCursor(config.stateRoot)
+      clearPending(config)
+      process.stdout.write(`已清空消化游标与待落盘建议（${config.stateRoot}/state/）。\n`)
       return 0
     }
 
