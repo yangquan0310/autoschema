@@ -1,0 +1,54 @@
+{
+  "name": "autoschema",
+  "version": "0.1.0",
+  "description": "AutoSchema — 让 agent 的自我图式（风格/信念/价值观）随日记演化：皮亚杰式的非平衡 → 同化 / 顺应 → 平衡",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./cli": {
+      "types": "./dist/cli.d.ts",
+      "default": "./dist/cli.js"
+    }
+  },
+  "bin": {
+    "autoschema": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "pnpm run typecheck && pnpm run test && pnpm run build",
+    "cli": "node dist/cli.js",
+    "pack:dist": "node scripts/pack-dist.mjs"
+  },
+  "keywords": [
+    "agent",
+    "identity",
+    "schema",
+    "piaget",
+    "assimilation",
+    "accommodation",
+    "deepseek",
+    "dsh"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "tsup": "8.5.1",
+    "typescript": "5.9.3",
+    "vitest": "3.2.7"
+  },
+  "engines": {
+    "node": ">=22.19"
+  }
+}

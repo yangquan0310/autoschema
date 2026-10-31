@@ -1,0 +1,12 @@
+node_modules/
+node_modules
+dist/*
+!dist/index.js
+!dist/index.d.ts
+!dist/cli.js
+!dist/cli.d.ts
+*.tsbuildinfo
+coverage/
+*.log
+.DS_Store
+*.tgz
