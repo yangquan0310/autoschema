@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 // src/cli.ts
-import path6 from "path";
+import path7 from "path";
 
 // src/config.ts
 import path3 from "path";
@@ -126,6 +126,20 @@ function defaultConfig() {
     diaryChars: 1800,
     maxInputChars: 6e4,
     stateRoot: DEFAULT_STATE_ROOT,
+    trigger: {
+      modes: ["manual"],
+      cooldownMs: 36e5,
+      minNewDiaries: 5,
+      applyMode: "propose",
+      schedule: { intervalMinutes: 1440, skipIfOverdueMinutes: 720 },
+      hook: { events: ["compaction/start"], cooldownMs: 18e5 }
+    },
+    digest: {
+      limit: 30,
+      onlyUndigested: true,
+      diaryChars: 1800,
+      maxInputChars: 6e4
+    },
     deepseek: {
       baseUrl: "https://api.deepseek.com",
       model: "deepseek-chat",
@@ -167,6 +181,23 @@ function loadConfig(options = {}) {
   merged.maxInputChars = Math.round(clamp(merged.maxInputChars, 2e3, 4e5));
   merged.diaryLimit = Math.round(clamp(merged.diaryLimit, 1, 500));
   merged.deepseek.temperature = clamp(merged.deepseek.temperature, 0, 2);
+  if (onDisk?.digest !== void 0) {
+    merged.diaryLimit = merged.digest.limit;
+    merged.diaryChars = merged.digest.diaryChars;
+    merged.maxInputChars = merged.digest.maxInputChars;
+  } else {
+    merged.digest.limit = merged.diaryLimit;
+    merged.digest.diaryChars = merged.diaryChars;
+    merged.digest.maxInputChars = merged.maxInputChars;
+  }
+  merged.digest.limit = Math.round(clamp(merged.digest.limit, 1, 500));
+  merged.digest.diaryChars = Math.round(clamp(merged.digest.diaryChars, 200, 2e4));
+  merged.digest.maxInputChars = Math.round(clamp(merged.digest.maxInputChars, 2e3, 4e5));
+  if (!Array.isArray(merged.trigger.modes) || merged.trigger.modes.length === 0) merged.trigger.modes = ["manual"];
+  merged.trigger.cooldownMs = Math.max(0, merged.trigger.cooldownMs);
+  merged.trigger.hook.cooldownMs = Math.max(0, merged.trigger.hook.cooldownMs);
+  merged.trigger.minNewDiaries = Math.max(1, Math.round(merged.trigger.minNewDiaries));
+  merged.trigger.schedule.intervalMinutes = Math.max(1, Math.round(merged.trigger.schedule.intervalMinutes));
   merged.agentsFile = path3.resolve(merged.agentsFile);
   merged.memoryRoot = path3.resolve(merged.memoryRoot);
   return merged;
@@ -185,6 +216,23 @@ function validateConfig(config) {
   if (!Number.isFinite(config.diaryLimit) || config.diaryLimit < 1) problems.push("diaryLimit \u5FC5\u987B \u2265 1");
   if (!/^https?:\/\//u.test(config.deepseek.baseUrl)) problems.push("deepseek.baseUrl \u5FC5\u987B\u662F http(s)");
   if (!config.deepseek.model) problems.push("deepseek.model \u4E0D\u80FD\u4E3A\u7A7A");
+  const allowedModes = ["manual", "schedule", "hook"];
+  if (!config.trigger.modes.every((mode) => allowedModes.includes(mode))) {
+    problems.push("trigger.modes \u53EA\u80FD\u662F manual / schedule / hook");
+  }
+  if (config.trigger.modes.includes("schedule") && config.trigger.schedule.intervalMinutes < 1) {
+    problems.push("trigger.schedule.intervalMinutes \u5FC5\u987B \u2265 1");
+  }
+  const allowedHooks = ["compaction/start", "agent/pre-step", "agent/idle", "session/start"];
+  if (!config.trigger.hook.events.every((event) => allowedHooks.includes(event))) {
+    problems.push("trigger.hook.events \u53EA\u80FD\u53D6 compaction/start\u3001agent/pre-step\u3001agent/idle\u3001session/start");
+  }
+  if (config.trigger.modes.includes("hook") && config.trigger.hook.events.length === 0) {
+    problems.push('hook \u6A21\u5F0F\u4E0B trigger.hook.events \u4E0D\u80FD\u4E3A\u7A7A\uFF08\u8981\u6302"\u7279\u5B9A\u7684"\u751F\u547D\u5468\u671F\u70B9\uFF09');
+  }
+  if (config.trigger.applyMode !== "propose" && config.trigger.applyMode !== "apply") {
+    problems.push("trigger.applyMode \u53EA\u80FD\u662F propose \u6216 apply");
+  }
   return problems;
 }
 function resolveApiKey(config) {
@@ -193,79 +241,6 @@ function resolveApiKey(config) {
     path3.join(process.env.HOME ?? "", ".dsh", ".env"),
     path3.join(config.memoryRoot, ".env")
   ]);
-}
-
-// src/diaries.ts
-import fs2 from "fs";
-import path4 from "path";
-function eventsDir(memoryRoot) {
-  return path4.join(memoryRoot, "events");
-}
-function listEventIds(memoryRoot) {
-  const dir = eventsDir(memoryRoot);
-  let names = [];
-  try {
-    names = fs2.readdirSync(dir);
-  } catch {
-    return [];
-  }
-  return names.filter((name) => name.endsWith(".json") && !name.startsWith("_")).map((name) => name.slice(0, -".json".length));
-}
-function readDiary(memoryRoot, eventId) {
-  const json = readJsonFile(path4.join(eventsDir(memoryRoot), `${eventId}.json`));
-  if (json === void 0) return void 0;
-  const md = readTextFile(path4.join(eventsDir(memoryRoot), `${eventId}.md`));
-  const diary = (md ?? json.diary ?? "").trim();
-  if (diary === "") return void 0;
-  const structured = json.structured ?? {};
-  return {
-    eventId: json.id ?? eventId,
-    occurredAt: structured.startedAt ?? "",
-    endedAt: structured.endedAt ?? "",
-    title: structured.title ?? "(\u65E0\u6807\u9898)",
-    status: structured.outcome?.status ?? "ongoing",
-    tags: Array.isArray(structured.tags) ? structured.tags.filter((t) => typeof t === "string") : [],
-    people: Array.isArray(structured.people) ? structured.people.map((p) => p?.name ?? "").filter((name) => name !== "") : [],
-    diary
-  };
-}
-function collectDiaries(memoryRoot, query) {
-  const entries = [];
-  for (const id of listEventIds(memoryRoot)) {
-    const entry = readDiary(memoryRoot, id);
-    if (entry !== void 0) entries.push(entry);
-  }
-  const timeOf = (entry) => {
-    const parsed = Date.parse(entry.occurredAt);
-    if (!Number.isNaN(parsed)) return parsed;
-    const fromId = /^ev_(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})/u.exec(entry.eventId);
-    if (fromId !== null) {
-      const [, y, mo, d, h, mi, s] = fromId;
-      return Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h) - 8, Number(mi), Number(s));
-    }
-    return 0;
-  };
-  const sinceMs = query.since === void 0 ? void 0 : Date.parse(query.since);
-  const sorted = entries.filter((entry) => sinceMs === void 0 || Number.isNaN(sinceMs) ? true : timeOf(entry) >= sinceMs).sort((a, b) => timeOf(b) - timeOf(a));
-  const selected = [];
-  let budget = query.maxChars;
-  for (const entry of sorted) {
-    if (selected.length >= query.limit) break;
-    if (budget <= 0) break;
-    const body = truncate(entry.diary, query.diaryChars);
-    selected.push({ ...entry, diary: body });
-    budget -= body.length + 200;
-  }
-  return selected;
-}
-function renderDiaries(entries) {
-  return entries.map((entry) => {
-    const head = `### ${entry.occurredAt || "(\u65E0\u65F6\u95F4)"} \xB7 ${entry.title} \xB7 ${entry.status}`;
-    const meta = [`\u4E8B\u4EF6 ID\uFF1A${entry.eventId}`];
-    if (entry.tags.length > 0) meta.push(`\u6807\u7B7E\uFF1A${entry.tags.join("\u3001")}`);
-    if (entry.people.length > 0) meta.push(`\u4EBA\u7269\uFF1A${entry.people.join("\u3001")}`);
-    return [head, meta.join("\u3000|\u3000"), "", entry.diary].join("\n");
-  }).join("\n\n---\n\n");
 }
 
 // src/deepseek.ts
@@ -345,9 +320,82 @@ var DeepseekClient = class {
   }
 };
 
+// src/diaries.ts
+import fs2 from "fs";
+import path4 from "path";
+function eventsDir(memoryRoot) {
+  return path4.join(memoryRoot, "events");
+}
+function listEventIds(memoryRoot) {
+  const dir = eventsDir(memoryRoot);
+  let names = [];
+  try {
+    names = fs2.readdirSync(dir);
+  } catch {
+    return [];
+  }
+  return names.filter((name) => name.endsWith(".json") && !name.startsWith("_")).map((name) => name.slice(0, -".json".length));
+}
+function readDiary(memoryRoot, eventId) {
+  const json = readJsonFile(path4.join(eventsDir(memoryRoot), `${eventId}.json`));
+  if (json === void 0) return void 0;
+  const md = readTextFile(path4.join(eventsDir(memoryRoot), `${eventId}.md`));
+  const diary = (md ?? json.diary ?? "").trim();
+  if (diary === "") return void 0;
+  const structured = json.structured ?? {};
+  return {
+    eventId: json.id ?? eventId,
+    occurredAt: structured.startedAt ?? "",
+    endedAt: structured.endedAt ?? "",
+    title: structured.title ?? "(\u65E0\u6807\u9898)",
+    status: structured.outcome?.status ?? "ongoing",
+    tags: Array.isArray(structured.tags) ? structured.tags.filter((t) => typeof t === "string") : [],
+    people: Array.isArray(structured.people) ? structured.people.map((p) => p?.name ?? "").filter((name) => name !== "") : [],
+    diary
+  };
+}
+function collectDiaries(memoryRoot, query) {
+  const entries = [];
+  for (const id of listEventIds(memoryRoot)) {
+    const entry = readDiary(memoryRoot, id);
+    if (entry !== void 0) entries.push(entry);
+  }
+  const timeOf = (entry) => {
+    const parsed = Date.parse(entry.occurredAt);
+    if (!Number.isNaN(parsed)) return parsed;
+    const fromId = /^ev_(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})/u.exec(entry.eventId);
+    if (fromId !== null) {
+      const [, y, mo, d, h, mi, s] = fromId;
+      return Date.UTC(Number(y), Number(mo) - 1, Number(d), Number(h) - 8, Number(mi), Number(s));
+    }
+    return 0;
+  };
+  const sinceMs = query.since === void 0 ? void 0 : Date.parse(query.since);
+  const sorted = entries.filter((entry) => sinceMs === void 0 || Number.isNaN(sinceMs) ? true : timeOf(entry) >= sinceMs).sort((a, b) => timeOf(b) - timeOf(a));
+  const selected = [];
+  let budget = query.maxChars;
+  for (const entry of sorted) {
+    if (selected.length >= query.limit) break;
+    if (budget <= 0) break;
+    const body = truncate(entry.diary, query.diaryChars);
+    selected.push({ ...entry, diary: body });
+    budget -= body.length + 200;
+  }
+  return selected;
+}
+function renderDiaries(entries) {
+  return entries.map((entry) => {
+    const head = `### ${entry.occurredAt || "(\u65E0\u65F6\u95F4)"} \xB7 ${entry.title} \xB7 ${entry.status}`;
+    const meta = [`\u4E8B\u4EF6 ID\uFF1A${entry.eventId}`];
+    if (entry.tags.length > 0) meta.push(`\u6807\u7B7E\uFF1A${entry.tags.join("\u3001")}`);
+    if (entry.people.length > 0) meta.push(`\u4EBA\u7269\uFF1A${entry.people.join("\u3001")}`);
+    return [head, meta.join("\u3000|\u3000"), "", entry.diary].join("\n");
+  }).join("\n\n---\n\n");
+}
+
 // src/reconcile.ts
 import fs3 from "fs";
-import path5 from "path";
+import path6 from "path";
 
 // src/types.ts
 var SECTION_LABELS = {
@@ -535,6 +583,75 @@ function applyChanges(doc, assimilation, accommodation, options = {}) {
   }
   void options;
   return { doc: next, applied: { assimilation: appliedAssimilation, accommodation: appliedAccommodation }, skipped };
+}
+
+// src/cursor.ts
+import path5 from "path";
+var VERSION = 1;
+function cursorFile(stateRoot) {
+  return path5.join(stateRoot, "state", "cursor.json");
+}
+function emptyCursor() {
+  return { version: VERSION, digested: {}, proposed: {} };
+}
+function loadCursor(stateRoot) {
+  const raw = readJsonFile(cursorFile(stateRoot));
+  if (raw === void 0 || typeof raw !== "object" || typeof raw.digested !== "object" || raw.digested === null) {
+    return emptyCursor();
+  }
+  return {
+    ...emptyCursor(),
+    ...raw,
+    version: VERSION,
+    digested: raw.digested ?? {},
+    proposed: raw.proposed ?? {}
+  };
+}
+function saveCursor(stateRoot, cursor) {
+  ensureDir(path5.join(stateRoot, "state"));
+  writeJsonFile(cursorFile(stateRoot), { ...cursor, version: VERSION });
+}
+function isDigested(cursor, eventId) {
+  return cursor.digested[eventId] !== void 0;
+}
+function isPending(cursor, eventId) {
+  return cursor.proposed[eventId] !== void 0;
+}
+function isSettled(cursor, eventId) {
+  return isDigested(cursor, eventId) || isPending(cursor, eventId);
+}
+function filterUndigested(cursor, entries) {
+  return entries.filter((entry) => !isSettled(cursor, entry.eventId));
+}
+function countUndigested(cursor, eventIds) {
+  return eventIds.reduce((sum, id) => isSettled(cursor, id) ? sum : sum + 1, 0);
+}
+function markDigested(cursor, eventIds, runId = nowIso()) {
+  const digested = { ...cursor.digested };
+  const proposed = { ...cursor.proposed };
+  const at = nowIso();
+  for (const eventId of eventIds) {
+    digested[eventId] = { at, runId };
+    delete proposed[eventId];
+  }
+  return { ...cursor, digested, proposed, lastRunAt: at, lastRunId: runId, skippedRuns: 0 };
+}
+function markProposed(cursor, eventIds, runId = nowIso()) {
+  const proposed = { ...cursor.proposed };
+  const at = nowIso();
+  for (const eventId of eventIds) if (cursor.digested[eventId] === void 0) proposed[eventId] = { at, runId };
+  return { ...cursor, proposed, lastRunAt: at, lastRunId: runId, skippedRuns: 0 };
+}
+function markRun(cursor, runId = nowIso()) {
+  return { ...cursor, lastRunAt: nowIso(), lastRunId: runId };
+}
+function msSinceLastRun(cursor, now = Date.now()) {
+  if (cursor.lastRunAt === void 0) return Number.POSITIVE_INFINITY;
+  const parsed = Date.parse(cursor.lastRunAt);
+  return Number.isNaN(parsed) ? Number.POSITIVE_INFINITY : now - parsed;
+}
+function resetCursor(stateRoot) {
+  saveCursor(stateRoot, emptyCursor());
 }
 
 // src/prompt.ts
@@ -768,17 +885,17 @@ function gatherDiaries(config, limit, since) {
   });
 }
 function snapshotSchema(config, raw) {
-  const historyDir = path5.join(config.stateRoot, "history");
+  const historyDir = path6.join(config.stateRoot, "history");
   ensureDir(historyDir);
   const stamp = timestampForFile();
-  let file = path5.join(historyDir, `AGENTS-${stamp}.md`);
+  let file = path6.join(historyDir, `AGENTS-${stamp}.md`);
   let counter = 1;
   while (fs3.existsSync(file)) {
-    file = path5.join(historyDir, `AGENTS-${stamp}-${counter}.md`);
+    file = path6.join(historyDir, `AGENTS-${stamp}-${counter}.md`);
     counter += 1;
   }
   writeTextAtomic(file, raw);
-  const logFile = path5.join(historyDir, "changelog.jsonl");
+  const logFile = path6.join(historyDir, "changelog.jsonl");
   const line = JSON.stringify({ at: nowIso(), file, chars: raw.length });
   fs3.appendFileSync(logFile, `${line}
 `, "utf8");
@@ -789,10 +906,14 @@ async function run(options) {
   const logger = options.logger ?? createLogger();
   const dryRun = options.dryRun !== false;
   const before = readSchema(config);
-  const diaries = gatherDiaries(config, options.limit, options.since);
+  const onlyUndigested = options.onlyUndigested ?? config.digest.onlyUndigested;
+  const cursor = loadCursor(config.stateRoot);
+  const gathered = gatherDiaries(config, options.limit, options.since);
+  const diaries = onlyUndigested ? filterUndigested(cursor, gathered) : gathered;
+  const skippedDigested = gathered.length - diaries.length;
   if (diaries.length === 0) {
     throw new Error(
-      `\u6CA1\u6709\u53EF\u7528\u65E5\u8BB0\uFF1A${config.memoryRoot}/events \u4E3A\u7A7A\uFF0C\u6216 since/limit \u8FC7\u6EE4\u540E\u65E0\u5185\u5BB9\u3002\u5148\u8DD1\u4E00\u6B21 AutoBioMemory \u7684\u6574\u7406\u3002`
+      gathered.length === 0 ? `\u6CA1\u6709\u53EF\u7528\u65E5\u8BB0\uFF1A${config.memoryRoot}/events \u4E3A\u7A7A\uFF0C\u6216 since/limit \u8FC7\u6EE4\u540E\u65E0\u5185\u5BB9\u3002\u5148\u8DD1\u4E00\u6B21 AutoBioMemory \u7684\u6574\u7406\u3002` : `\u6CA1\u6709"\u672A\u6D88\u5316"\u7684\u65E5\u8BB0\uFF08\u6700\u8FD1 ${gathered.length} \u7BC7\u90FD\u5DF2\u5438\u6536\uFF09\u3002\u7528 --all \u6216 digest.onlyUndigested=false \u91CD\u65B0\u5206\u6790\u5168\u90E8\u3002`
     );
   }
   logger.info(`\u56FE\u5F0F\uFF1A\u98CE\u683C ${before.style.length} / \u4FE1\u5FF5 ${before.belief.length} / \u4EF7\u503C\u89C2 ${before.value.length} \u6761\uFF1B\u65E5\u8BB0 ${diaries.length} \u7BC7`);
@@ -815,8 +936,22 @@ async function run(options) {
     wrote = true;
     logger.info(`\u5DF2\u5199\u56DE ${config.agentsFile}\uFF08\u5FEB\u7167\uFF1A${snapshot}\uFF09`);
   }
+  const runId = options.runId ?? nowIso();
+  const ids = diaries.map((entry) => entry.eventId);
+  const proposedCount = analysis.assimilation.length + analysis.accommodation.length;
+  let pendingSaved = false;
+  if (options.markDigested !== false) {
+    const next = wrote ? markDigested(cursor, ids, runId) : proposedCount > 0 ? markProposed(cursor, ids, runId) : markRun(cursor, runId);
+    saveCursor(config.stateRoot, next);
+    if (!wrote && proposedCount > 0) {
+      writeJsonFile(pendingFile(config.stateRoot), { at: nowIso(), runId, analysis, eventIds: ids });
+      pendingSaved = true;
+    }
+  }
   const result = {
     analysis,
+    digestedIds: diaries.map((entry) => entry.eventId),
+    skippedDigested,
     before,
     after: merged.doc,
     applied: merged.applied,
@@ -824,9 +959,10 @@ async function run(options) {
     diaries,
     rendered,
     wrote,
+    pendingSaved,
     ...snapshot === void 0 ? {} : { snapshot }
   };
-  writeJsonFile(path5.join(config.stateRoot, "last-run.json"), {
+  writeJsonFile(path6.join(config.stateRoot, "last-run.json"), {
     at: nowIso(),
     dryRun,
     equilibriumScore: analysis.equilibriumScore,
@@ -845,6 +981,38 @@ function requireApiKey(config) {
     );
   }
   return key;
+}
+function pendingFile(stateRoot) {
+  return path6.join(stateRoot, "state", "pending.json");
+}
+function loadPending(config) {
+  return readJsonFile(pendingFile(config.stateRoot));
+}
+function clearPending(config) {
+  try {
+    fs3.rmSync(pendingFile(config.stateRoot));
+  } catch {
+  }
+}
+function applyProposal(config, proposal, options = {}) {
+  const before = readSchema(config);
+  const merged = applyChanges(before, proposal.analysis.assimilation, proposal.analysis.accommodation);
+  const rendered = renderSchemaDoc(merged.doc);
+  let snapshot;
+  if (merged.applied.assimilation + merged.applied.accommodation > 0) {
+    snapshot = snapshotSchema(config, readTextFile(config.agentsFile) ?? "");
+    writeSchemaDoc(config.agentsFile, merged.doc);
+  }
+  const cursor = loadCursor(config.stateRoot);
+  saveCursor(config.stateRoot, markDigested(cursor, proposal.eventIds, options.runId ?? proposal.runId));
+  clearPending(config);
+  return {
+    after: merged.doc,
+    applied: merged.applied,
+    skipped: merged.skipped,
+    rendered,
+    ...snapshot === void 0 ? {} : { snapshot }
+  };
 }
 function renderReport(result) {
   const { analysis, applied, skipped } = result;
@@ -889,7 +1057,7 @@ function renderReport(result) {
   return lines.join("\n");
 }
 function listHistory(config) {
-  const logFile = path5.join(config.stateRoot, "history", "changelog.jsonl");
+  const logFile = path6.join(config.stateRoot, "history", "changelog.jsonl");
   const text = readTextFile(logFile);
   if (text === void 0) return [];
   return text.split("\n").filter((line) => line.trim() !== "").map((line) => {
@@ -899,6 +1067,167 @@ function listHistory(config) {
       return void 0;
     }
   }).filter((entry) => entry !== void 0);
+}
+
+// src/schedule.ts
+function nextAtTime(now, atTime) {
+  const match = /^(\d{1,2}):(\d{2})$/u.exec(atTime.trim());
+  if (match === null) return void 0;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (hours > 23 || minutes > 59) return void 0;
+  const target = new Date(now);
+  target.setHours(hours, minutes, 0, 0);
+  if (target.getTime() <= now.getTime()) target.setDate(target.getDate() + 1);
+  return target.getTime();
+}
+function checkDue(config, now = /* @__PURE__ */ new Date()) {
+  if (!config.trigger.modes.includes("schedule")) {
+    return { due: false, reason: "trigger.modes \u672A\u542F\u7528 schedule", waitMs: Number.POSITIVE_INFINITY, undigested: 0 };
+  }
+  const cursor = loadCursor(config.stateRoot);
+  const undigested = countUndigested(cursor, listEventIds(config.memoryRoot));
+  if (undigested < config.trigger.minNewDiaries) {
+    return {
+      due: false,
+      reason: `\u672A\u6D88\u5316\u65E5\u8BB0\u4E0D\u8DB3\uFF08${undigested} < ${config.trigger.minNewDiaries}\uFF09`,
+      waitMs: 0,
+      undigested
+    };
+  }
+  const sinceLast = msSinceLastRun(cursor, now.getTime());
+  const cooldown = Math.max(config.trigger.cooldownMs, config.trigger.schedule.intervalMinutes * 6e4);
+  if (sinceLast < cooldown) {
+    const waitMs = cooldown - sinceLast;
+    return {
+      due: false,
+      reason: `\u51B7\u5374\u4E2D\uFF08\u8FD8\u9700 ${Math.ceil(waitMs / 6e4)} \u5206\u949F\uFF1B\u95F4\u9694 ${Math.round(cooldown / 6e4)} \u5206\u949F\uFF09`,
+      waitMs,
+      undigested
+    };
+  }
+  const atTime = config.trigger.schedule.atTime;
+  if (atTime !== void 0) {
+    const next = nextAtTime(now, atTime);
+    if (next === void 0) {
+      return { due: false, reason: `trigger.schedule.atTime \u683C\u5F0F\u65E0\u6548\uFF1A${atTime}\uFF08\u5E94\u4E3A HH:MM\uFF09`, waitMs: 0, undigested };
+    }
+    const todayTarget = new Date(now);
+    const [h, m] = atTime.split(":").map(Number);
+    todayTarget.setHours(h, m, 0, 0);
+    const lastRun = cursor.lastRunAt === void 0 ? 0 : Date.parse(cursor.lastRunAt);
+    const alreadyRanSinceTarget = !Number.isNaN(lastRun) && lastRun >= todayTarget.getTime();
+    if (now.getTime() >= todayTarget.getTime() && !alreadyRanSinceTarget) {
+      const overdueMs = now.getTime() - todayTarget.getTime();
+      const skipAfter = config.trigger.schedule.skipIfOverdueMinutes * 6e4;
+      if (skipAfter > 0 && overdueMs > skipAfter) {
+        return {
+          due: false,
+          reason: `\u5DF2\u9519\u8FC7 ${atTime} \u7684\u7A97\u53E3 ${Math.round(overdueMs / 6e4)} \u5206\u949F\uFF08skipIfOverdueMinutes=${config.trigger.schedule.skipIfOverdueMinutes}\uFF09`,
+          waitMs: next - now.getTime(),
+          undigested
+        };
+      }
+      return { due: true, reason: `\u5230\u8FBE\u6BCF\u65E5\u56FA\u5B9A\u65F6\u523B ${atTime}`, waitMs: 0, undigested };
+    }
+    return {
+      due: false,
+      reason: alreadyRanSinceTarget ? `\u4ECA\u65E5 ${atTime} \u5DF2\u8DD1\u8FC7` : `\u7B49\u5F85\u6BCF\u65E5\u56FA\u5B9A\u65F6\u523B ${atTime}`,
+      waitMs: next - now.getTime(),
+      undigested
+    };
+  }
+  return { due: true, reason: `\u6EE1\u8DB3\u95F4\u9694 ${config.trigger.schedule.intervalMinutes} \u5206\u949F\u4E14\u65B0\u65E5\u8BB0 ${undigested} \u7BC7`, waitMs: 0, undigested };
+}
+function checkHookDue(config, now = /* @__PURE__ */ new Date()) {
+  if (!config.trigger.modes.includes("hook")) {
+    return { due: false, reason: "trigger.modes \u672A\u542F\u7528 hook", waitMs: Number.POSITIVE_INFINITY, undigested: 0 };
+  }
+  const events = config.trigger.hook.events;
+  if (events.length === 0) {
+    return { due: false, reason: "trigger.hook.events \u4E3A\u7A7A\uFF08\u672A\u9009\u62E9\u6302\u70B9\uFF09", waitMs: Number.POSITIVE_INFINITY, undigested: 0 };
+  }
+  const cursor = loadCursor(config.stateRoot);
+  const undigested = countUndigested(cursor, listEventIds(config.memoryRoot));
+  if (undigested < config.trigger.minNewDiaries) {
+    return {
+      due: false,
+      reason: `\u672A\u6D88\u5316\u65E5\u8BB0\u4E0D\u8DB3\uFF08${undigested} < ${config.trigger.minNewDiaries}\uFF09`,
+      waitMs: 0,
+      undigested
+    };
+  }
+  const cooldown = Math.max(0, config.trigger.hook.cooldownMs);
+  const sinceLast = msSinceLastRun(cursor, now.getTime());
+  if (sinceLast < cooldown) {
+    const waitMs = cooldown - sinceLast;
+    return {
+      due: false,
+      reason: `hook \u51B7\u5374\u4E2D\uFF08\u8FD8\u9700 ${Math.ceil(waitMs / 6e4)} \u5206\u949F\uFF1BcooldownMs=${cooldown}\uFF09`,
+      waitMs,
+      undigested
+    };
+  }
+  return {
+    due: true,
+    reason: `hook \u95F8\u95E8\u901A\u8FC7\uFF08\u6302\u70B9 ${events.join("\u3001")}\uFF0C\u672A\u6D88\u5316 ${undigested} \u7BC7\uFF09`,
+    waitMs: 0,
+    undigested
+  };
+}
+function recordSkip(config) {
+  const cursor = loadCursor(config.stateRoot);
+  saveCursor(config.stateRoot, { ...cursor, lastRunAt: nowIso(), skippedRuns: (cursor.skippedRuns ?? 0) + 1 });
+}
+function cronLine(config, cliPath = "autoschema") {
+  const minutes = config.trigger.schedule.intervalMinutes;
+  if (config.trigger.schedule.atTime !== void 0) {
+    const [h, m] = config.trigger.schedule.atTime.split(":");
+    return `${Number(m)} ${Number(h)} * * * ${cliPath} tick --state ${config.stateRoot} >> ${config.stateRoot}/logs/tick.log 2>&1`;
+  }
+  if (minutes % 60 === 0) {
+    return `0 */${Math.max(1, minutes / 60)} * * * ${cliPath} tick --state ${config.stateRoot} >> ${config.stateRoot}/logs/tick.log 2>&1`;
+  }
+  return `*/${minutes} * * * * ${cliPath} tick --state ${config.stateRoot} >> ${config.stateRoot}/logs/tick.log 2>&1`;
+}
+
+// src/tick.ts
+function describe(result) {
+  const parts = [
+    `\u5E73\u8861\u5EA6 ${Math.round(result.analysis.equilibriumScore * 100)}%`,
+    `\u975E\u5E73\u8861 ${result.analysis.disequilibrium.length}`,
+    `\u540C\u5316 ${result.applied.assimilation}/${result.analysis.assimilation.length}`,
+    `\u987A\u5E94 ${result.applied.accommodation}/${result.analysis.accommodation.length}`
+  ];
+  const sections = ["style", "belief", "value"].map((section) => `${SECTION_LABELS[section]}${result.after[section].length}`).join(" ");
+  return `${parts.join(" \xB7 ")}\uFF08\u56FE\u5F0F\uFF1A${sections}\uFF09`;
+}
+async function tick(options) {
+  const logger = options.logger ?? createLogger();
+  const { config } = options;
+  if (options.origin !== "manual") {
+    const due = options.origin === "hook" ? checkHookDue(config) : checkDue(config);
+    if (!due.due) {
+      if (!options.dryCheck) recordSkip(config);
+      logger.debug(`\u8DF3\u8FC7\uFF1A${due.reason}`);
+      return { ran: false, due, mode: "skipped", message: due.reason };
+    }
+  } else if (options.dryCheck) {
+    return { ran: false, due: checkDue(config), mode: "skipped", message: "manual dry-check" };
+  }
+  const applyNow = options.origin === "manual" ? false : config.trigger.applyMode === "apply";
+  const result = await run({
+    config,
+    logger,
+    dryRun: !applyNow,
+    ...options.client === void 0 ? {} : { client: options.client },
+    runId: nowIso()
+  });
+  const mode = result.wrote ? "applied" : "proposed";
+  const message = describe(result);
+  if (result.wrote) logger.info(`\u5DF2\u5199\u56DE AGENTS.md\uFF1A${message}`);
+  else logger.info(`\u5EFA\u8BAE\u5DF2\u5C31\u7EEA\uFF08\u5F85\u843D\u76D8\uFF09\uFF1A${message}`);
+  return { ran: true, result, mode, message };
 }
 
 // src/cli.ts
@@ -933,13 +1262,19 @@ var num = (args, key) => {
 };
 var bool = (args, key) => args.flags.has(key);
 function help() {
-  process.stdout.write(`AutoSchema 0.1.0 \u2014 \u8BA9\u81EA\u6211\u56FE\u5F0F\u968F\u65E5\u8BB0\u6F14\u5316\uFF08\u76AE\u4E9A\u6770\uFF1A\u975E\u5E73\u8861 \u2192 \u540C\u5316/\u987A\u5E94 \u2192 \u5E73\u8861\uFF09
+  process.stdout.write(`AutoSchema 0.2.0 \u2014 \u8BA9\u81EA\u6211\u56FE\u5F0F\u968F\u65E5\u8BB0\u6F14\u5316\uFF08\u76AE\u4E9A\u6770\uFF1A\u975E\u5E73\u8861 \u2192 \u540C\u5316/\u987A\u5E94 \u2192 \u5E73\u8861\uFF09
 
 \u7528\u6CD5\uFF1Aautoschema <command> [options]
 
 \u547D\u4EE4\uFF1A
-  analyze      \u5206\u6790\u5E76\u6253\u5370\u5EFA\u8BAE\uFF08\u4E0D\u5199\u56DE\uFF09\uFF1B--limit N --since ISO --json
-  apply        \u5206\u6790\u5E76\u5199\u56DE AGENTS.md\uFF08\u5148\u5FEB\u7167\u5230\u72B6\u6001\u6839 history/\uFF09
+  analyze      \u5206\u6790\u5E76\u6253\u5370\u5EFA\u8BAE\uFF08\u4E0D\u5199\u56DE\uFF09\uFF1B--limit N --since ISO --all --json
+  apply        \u843D\u76D8\u5F85\u5BA1\u5EFA\u8BAE\uFF08\u82E5\u6709 pending \u5219\u4E0D\u518D\u8C03\u6A21\u578B\uFF09\uFF1B--re-analyze \u5F3A\u5236\u91CD\u7B97
+  tick         \u4F9B cron/timer \u8C03\u7528\uFF1A\u6309\u95F8\u95E8\u5224\u65AD\u8BE5\u4E0D\u8BE5\u8DD1\uFF0C\u8BE5\u8DD1\u624D\u8DD1
+  daemon       \u5185\u7F6E\u5FAA\u73AF\uFF1A\u6BCF N \u79D2\u68C0\u67E5\u4E00\u6B21\u95F8\u95E8\uFF08\u9ED8\u8BA4 60s\uFF09
+  cron         \u6253\u5370\u5EFA\u8BAE\u7684 crontab \u884C
+  due          \u53EA\u68C0\u67E5"\u73B0\u5728\u8BE5\u4E0D\u8BE5\u8DD1"\uFF0C\u4E0D\u6267\u884C
+  pending      \u67E5\u770B\u5F85\u843D\u76D8\u5EFA\u8BAE\u7684\u6458\u8981
+  reset-cursor \u6E05\u7A7A\u6D88\u5316\u6E38\u6807\uFF08\u8BA9\u6240\u6709\u65E5\u8BB0\u91CD\u65B0\u53C2\u4E0E\u5206\u6790\uFF09
   show         \u6253\u5370\u5F53\u524D\u56FE\u5F0F\uFF08\u98CE\u683C/\u4FE1\u5FF5/\u4EF7\u503C\u89C2\uFF09
   history      \u5217\u51FA\u5386\u6B21\u5FEB\u7167
   init         \u521B\u5EFA\u72B6\u6001\u76EE\u5F55\u4E0E\u9ED8\u8BA4 config.json
@@ -960,14 +1295,14 @@ async function main() {
     return 0;
   }
   if (args.command === "--version" || args.command === "version") {
-    process.stdout.write("AutoSchema 0.1.0\n");
+    process.stdout.write("AutoSchema 0.2.0\n");
     return 0;
   }
   const config = loadConfig({
     ...str(args, "state") === void 0 ? {} : { stateRoot: str(args, "state") },
     patch: {
-      ...str(args, "agents") === void 0 ? {} : { agentsFile: path6.resolve(str(args, "agents")) },
-      ...str(args, "memory") === void 0 ? {} : { memoryRoot: path6.resolve(str(args, "memory")) }
+      ...str(args, "agents") === void 0 ? {} : { agentsFile: path7.resolve(str(args, "agents")) },
+      ...str(args, "memory") === void 0 ? {} : { memoryRoot: path7.resolve(str(args, "memory")) }
     }
   });
   switch (args.command) {
@@ -979,7 +1314,7 @@ async function main() {
           `\u72B6\u6001\u76EE\u5F55\uFF1A${config.stateRoot}`,
           `\u914D\u7F6E\u6587\u4EF6\uFF1A${file}`,
           `AGENTS.md\uFF1A${config.agentsFile}`,
-          `\u65E5\u8BB0\u76EE\u5F55\uFF1A${path6.join(config.memoryRoot, "events")}`,
+          `\u65E5\u8BB0\u76EE\u5F55\uFF1A${path7.join(config.memoryRoot, "events")}`,
           `DeepSeek key\uFF1A${maskSecret(resolveApiKey(config))}`,
           "",
           "\u4E0B\u4E00\u6B65\uFF1Aautoschema doctor\uFF0C\u7136\u540E autoschema analyze"
@@ -1007,8 +1342,7 @@ async function main() {
 `);
       return 0;
     }
-    case "analyze":
-    case "apply": {
+    case "analyze": {
       const problems = validateConfig(config);
       if (problems.length > 0) {
         process.stderr.write(`\u914D\u7F6E\u6709\u95EE\u9898\uFF1A
@@ -1019,13 +1353,128 @@ ${problems.map((p) => `  - ${p}`).join("\n")}
       const result = await run({
         config,
         logger,
-        dryRun: args.command !== "apply",
+        dryRun: true,
+        onlyUndigested: bool(args, "all") ? false : void 0,
         ...num(args, "limit") === void 0 ? {} : { limit: num(args, "limit") },
         ...str(args, "since") === void 0 ? {} : { since: str(args, "since") }
       });
       if (bool(args, "json")) process.stdout.write(`${JSON.stringify(result, null, 2)}
 `);
       else process.stdout.write(`${renderReport(result)}
+`);
+      return 0;
+    }
+    case "apply": {
+      const problems = validateConfig(config);
+      if (problems.length > 0) {
+        process.stderr.write(`\u914D\u7F6E\u6709\u95EE\u9898\uFF1A
+${problems.map((p) => `  - ${p}`).join("\n")}
+`);
+        return 2;
+      }
+      const pending = loadPending(config);
+      if (pending !== void 0 && !bool(args, "re-analyze")) {
+        const applied = applyProposal(config, pending);
+        process.stdout.write(
+          [
+            `\u5DF2\u843D\u76D8 pending \u5EFA\u8BAE\uFF08${pending.at}\uFF09\uFF1A\u540C\u5316 ${applied.applied.assimilation} \xB7 \u987A\u5E94 ${applied.applied.accommodation}`,
+            ...applied.skipped.map((reason) => `  \u8DF3\u8FC7\uFF1A${reason}`),
+            applied.snapshot === void 0 ? "\uFF08\u65E0\u53D8\u66F4\uFF0C\u672A\u5199\u6587\u4EF6\uFF09" : `\u5FEB\u7167\uFF1A${applied.snapshot}`,
+            `\u5DF2\u5199\u56DE\uFF1A${config.agentsFile}`
+          ].join("\n") + "\n"
+        );
+        return 0;
+      }
+      const result = await run({
+        config,
+        logger,
+        dryRun: false,
+        ...num(args, "limit") === void 0 ? {} : { limit: num(args, "limit") },
+        ...str(args, "since") === void 0 ? {} : { since: str(args, "since") }
+      });
+      if (bool(args, "json")) process.stdout.write(`${JSON.stringify(result, null, 2)}
+`);
+      else process.stdout.write(`${renderReport(result)}
+`);
+      return 0;
+    }
+    case "due": {
+      const due = checkDue(config);
+      process.stdout.write(
+        `${due.due ? "\u8BE5\u8DD1" : "\u4E0D\u8BE5\u8DD1"}\uFF1A${due.reason}\uFF5C\u672A\u6D88\u5316 ${due.undigested} \u7BC7` + (due.waitMs > 0 && due.waitMs !== Number.POSITIVE_INFINITY ? `\uFF5C\u8FD8\u9700 ${Math.ceil(due.waitMs / 6e4)} \u5206\u949F` : "") + "\n"
+      );
+      return 0;
+    }
+    case "tick": {
+      const outcome = await tick({ config, origin: "schedule", logger });
+      process.stdout.write(`${outcome.ran ? "\u5DF2\u8FD0\u884C" : "\u5DF2\u8DF3\u8FC7"}\uFF1A${outcome.message}
+`);
+      return 0;
+    }
+    case "daemon": {
+      const intervalSec = Math.max(5, num(args, "interval") ?? 60);
+      process.stdout.write(`AutoSchema daemon \u542F\u52A8\uFF1A\u6BCF ${intervalSec}s \u68C0\u67E5\u4E00\u6B21\u95F8\u95E8\uFF08Ctrl-C \u9000\u51FA\uFF09
+`);
+      let stopping = false;
+      process.on("SIGINT", () => {
+        stopping = true;
+        process.stdout.write("\n\u6536\u5230 SIGINT\uFF0C\u9000\u51FA\u3002\n");
+      });
+      while (!stopping) {
+        const due = checkDue(config);
+        if (due.due) {
+          try {
+            const outcome = await tick({ config, origin: "schedule", logger });
+            process.stdout.write(`${(/* @__PURE__ */ new Date()).toISOString()} \u8FD0\u884C\uFF1A${outcome.mode} ${outcome.message}
+`);
+          } catch (error) {
+            process.stderr.write(`${(/* @__PURE__ */ new Date()).toISOString()} \u8FD0\u884C\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}
+`);
+          }
+        } else {
+          process.stdout.write(`${(/* @__PURE__ */ new Date()).toISOString()} \u8DF3\u8FC7\uFF1A${due.reason}
+`);
+        }
+        await new Promise((resolve) => setTimeout(resolve, intervalSec * 1e3));
+      }
+      return 0;
+    }
+    case "cron": {
+      process.stdout.write(
+        [
+          "# \u628A\u4E0B\u9762\u4E00\u884C\u52A0\u5230 crontab -e\uFF08tick \u81EA\u5E26\u95F8\u95E8\uFF0C\u91CD\u590D\u8C03\u7528\u5B89\u5168\uFF09\uFF1A",
+          cronLine(config),
+          "",
+          "# \u6216\u8005\u7528 systemd timer \u8C03 tick\uFF1B\u4E5F\u53EF\u4EE5 `autoschema daemon --interval 300` \u5E38\u9A7B\u3002"
+        ].join("\n") + "\n"
+      );
+      return 0;
+    }
+    case "pending": {
+      const pending = loadPending(config);
+      if (pending === void 0) {
+        process.stdout.write("\u6CA1\u6709\u5F85\u843D\u76D8\u5EFA\u8BAE\u3002\n");
+        return 0;
+      }
+      process.stdout.write(
+        [
+          `\u5F85\u843D\u76D8\u5EFA\u8BAE\uFF1A${pending.at}\uFF08\u6279\u6B21 ${pending.runId}\uFF09`,
+          `  \u975E\u5E73\u8861 ${pending.analysis.disequilibrium.length} \xB7 \u540C\u5316 ${pending.analysis.assimilation.length} \xB7 \u987A\u5E94 ${pending.analysis.accommodation.length}`,
+          `  \u6D89\u53CA\u65E5\u8BB0 ${pending.eventIds.length} \u7BC7`,
+          `  \u843D\u76D8\uFF1Aautoschema apply`,
+          `  \u4E22\u5F03\uFF1Aautoschema apply --discard`
+        ].join("\n") + "\n"
+      );
+      if (bool(args, "discard")) {
+        clearPending(config);
+        process.stdout.write("\u5DF2\u4E22\u5F03\u5F85\u843D\u76D8\u5EFA\u8BAE\u3002\n");
+      }
+      return 0;
+    }
+    case "reset-cursor": {
+      resetCursor(config.stateRoot);
+      clearPending(config);
+      process.stdout.write(`\u5DF2\u6E05\u7A7A\u6D88\u5316\u6E38\u6807\u4E0E\u5F85\u843D\u76D8\u5EFA\u8BAE\uFF08${config.stateRoot}/state/\uFF09\u3002
 `);
       return 0;
     }
@@ -1039,7 +1488,7 @@ ${problems.map((p) => `  - ${p}`).join("\n")}
       push("\u914D\u7F6E\u6587\u4EF6", true, configFile(config.stateRoot));
       push("DeepSeek key", key !== void 0, maskSecret(key));
       const diaries = listEventIds(config.memoryRoot).length;
-      push("\u65E5\u8BB0\u6570\u91CF", diaries > 0, `${diaries} \u7BC7\uFF08${path6.join(config.memoryRoot, "events")}\uFF09`);
+      push("\u65E5\u8BB0\u6570\u91CF", diaries > 0, `${diaries} \u7BC7\uFF08${path7.join(config.memoryRoot, "events")}\uFF09`);
       const doc = readSchema(config);
       push("AGENTS.md", true, `${config.agentsFile}\uFF08\u98CE\u683C ${doc.style.length} / \u4FE1\u5FF5 ${doc.belief.length} / \u4EF7\u503C\u89C2 ${doc.value.length}\uFF09`);
       push("\u914D\u7F6E\u6821\u9A8C", validateConfig(config).length === 0, validateConfig(config).join("\uFF1B") || "\u901A\u8FC7");

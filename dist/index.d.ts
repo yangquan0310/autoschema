@@ -99,6 +99,71 @@ interface DeepseekConfig {
     jsonMode: boolean;
     retries: number;
 }
+/** 触发方式：manual=只手动；schedule=定时（外部 cron/timer 或内置 daemon）；hook=挂 dsh 生命周期。 */
+type TriggerMode = 'manual' | 'schedule' | 'hook';
+/** hook 允许挂在哪些 dsh 生命周期点（"特定的"挂点，不是任意事件）。 */
+type HookEvent = 'compaction/start' | 'agent/pre-step' | 'agent/idle' | 'session/start';
+interface ScheduleTriggerConfig {
+    /** 最小间隔（分钟）；到点且满足 minNewDiaries 才跑。 */
+    intervalMinutes: number;
+    /** 可选：每天固定时刻跑（HH:MM，本地时区），设置后优先于 intervalMinutes。 */
+    atTime?: string;
+    /** 错过时间窗太久的任务是否跳过（避免开机时补跑一堆）。 */
+    skipIfOverdueMinutes: number;
+}
+interface HookTriggerConfig {
+    /** 挂点集合；默认只有 compaction/start——特定、可控。 */
+    events: HookEvent[];
+    /** hook 触发的冷却（毫秒），避免每步都跑。 */
+    cooldownMs: number;
+}
+interface TriggerConfig {
+    /** 可同时开多种；manual 始终可用（CLI）。 */
+    modes: TriggerMode[];
+    /** 任何触发方式共用的最小间隔（毫秒）。 */
+    cooldownMs: number;
+    /** 至少有多少篇"未消化"日记才值得跑。 */
+    minNewDiaries: number;
+    /** 自动模式下的写回策略：propose=只出建议（默认），apply=直接写回。 */
+    applyMode: 'propose' | 'apply';
+    schedule: ScheduleTriggerConfig;
+    hook: HookTriggerConfig;
+}
+interface DigestConfig {
+    /** 单次最多喂多少篇。 */
+    limit: number;
+    /** 只喂未消化过的日记（默认 true）。 */
+    onlyUndigested: boolean;
+    /** 单篇截断长度。 */
+    diaryChars: number;
+    /** 总输入预算（字符）。 */
+    maxInputChars: number;
+}
+/** 消化游标：哪些日记已经被"吸收"进图式。 */
+interface DigestCursor {
+    version: number;
+    /** eventId → 已吸收进图式的时间与批次。 */
+    digested: Record<string, {
+        at: string;
+        runId: string;
+    }>;
+    /** eventId → 已分析出建议、但还没落盘的时间与批次（避免定时反复烧 token）。 */
+    proposed: Record<string, {
+        at: string;
+        runId: string;
+    }>;
+    lastRunAt?: string;
+    lastRunId?: string;
+    /** 连续跳过次数（用于 daemon 日志）。 */
+    skippedRuns?: number;
+}
+/** 待落盘的建议（`analyze` 产出、`apply` 消费，避免二次调用模型）。 */
+interface PendingProposal {
+    at: string;
+    runId: string;
+    analysis: Analysis;
+    eventIds: string[];
+}
 interface AutoSchemaConfig {
     version: number;
     /** AGENTS.md 路径（默认 ~/.dsh/AGENTS.md）。 */
@@ -115,6 +180,8 @@ interface AutoSchemaConfig {
     maxInputChars: number;
     /** 自身状态根（快照与变更历史）。 */
     stateRoot: string;
+    trigger: TriggerConfig;
+    digest: DigestConfig;
     deepseek: DeepseekConfig;
 }
 interface Logger {
@@ -132,7 +199,7 @@ interface ChatClient {
 }
 
 /** AutoSchema — 常量与默认值。 */
-declare const VERSION = "0.1.0";
+declare const VERSION = "0.2.0";
 
 /** AutoSchema — 配置：默认值、加载、校验。 */
 
@@ -302,9 +369,19 @@ interface RunOptions {
     limit?: number;
     /** 覆盖：时间下界。 */
     since?: string;
+    /** 覆盖：是否只喂未消化的日记（默认取 config.digest.onlyUndigested）。 */
+    onlyUndigested?: boolean;
+    /** 覆盖：跑完是否标记消化（默认 true；失败/异常不标记）。 */
+    markDigested?: boolean;
+    /** 运行批次 id（测试可注入）。 */
+    runId?: string;
 }
 interface RunResult {
     analysis: Analysis;
+    /** 本次实际消化（喂进去）的日记 id。 */
+    digestedIds: string[];
+    /** 因已消化被跳过的篇数。 */
+    skippedDigested: number;
     /** 变更前的图式。 */
     before: SchemaDoc;
     /** 变更后的图式（dryRun 时等于 before 加变更的草案，不落盘）。 */
@@ -319,6 +396,8 @@ interface RunResult {
     /** 写回成功后的快照路径。 */
     snapshot?: string;
     wrote: boolean;
+    /** 建议已存为待落盘（供 `apply` 直接消费，不必再调模型）。 */
+    pendingSaved: boolean;
 }
 /** 读取当前图式；文件不存在时返回空图式（而不是报错）。 */
 declare function readSchema(config: AutoSchemaConfig): SchemaDoc;
@@ -332,6 +411,26 @@ declare function snapshotSchema(config: AutoSchemaConfig, raw: string): string;
  * 传 `dryRun: false` 时才把结果写进 AGENTS.md（先快照）。
  */
 declare function run(options: RunOptions): Promise<RunResult>;
+/** 待落盘建议的位置。 */
+declare function pendingFile(stateRoot: string): string;
+/** 读取待落盘建议。 */
+declare function loadPending(config: AutoSchemaConfig): PendingProposal | undefined;
+declare function clearPending(config: AutoSchemaConfig): void;
+/**
+ * 直接落盘一份已算好的建议（`analyze` 之后 `apply`，不再调模型）。
+ */
+declare function applyProposal(config: AutoSchemaConfig, proposal: PendingProposal, options?: {
+    runId?: string;
+}): {
+    after: SchemaDoc;
+    applied: {
+        assimilation: number;
+        accommodation: number;
+    };
+    skipped: string[];
+    snapshot?: string;
+    rendered: string;
+};
 /** 人类可读报告（CLI 与测试共用）。 */
 declare function renderReport(result: RunResult): string;
 /** 图式变更历史。 */
@@ -340,6 +439,111 @@ declare function listHistory(config: AutoSchemaConfig): Array<{
     file: string;
     chars: number;
 }>;
+
+/**
+ * AutoSchema — 定时触发。
+ *
+ * 两种用法，都不依赖守护进程常驻也都能常驻：
+ *   1. 外部调度：`autoschema tick`（幂等）交给 cron / systemd timer，到点才真正干活；
+ *   2. 内置循环：`autoschema daemon --interval 60` 自己按分钟检查。
+ *
+ * 是否"该跑"由三道闸门决定：cooldown、minNewDiaries、可选固定时刻。
+ */
+
+interface DueCheck {
+    due: boolean;
+    reason: string;
+    /** 距离下次可跑还有多少毫秒（due=true 时为 0）。 */
+    waitMs: number;
+    undigested: number;
+}
+/** 解析 `HH:MM` 到今天（或明天）的时间点。 */
+declare function nextAtTime(now: Date, atTime: string): number | undefined;
+/**
+ * 判断现在是否该跑。
+ *
+ * 闸门顺序：模式允许 → 冷却 → 最小新日记数 → 固定时刻（若配置）。
+ */
+declare function checkDue(config: AutoSchemaConfig, now?: Date): DueCheck;
+/**
+ * hook 触发的闸门：只看 hook 自己的冷却与未消化数量。
+ *
+ * 与 schedule 闸门分开，是因为 hook 的时机由生命周期点决定（例如压缩开始时**必须**看一眼），
+ * 不该被"每日一次"这类间隔拦住；它用的是 `trigger.hook.cooldownMs`。
+ */
+declare function checkHookDue(config: AutoSchemaConfig, now?: Date): DueCheck;
+/** 记录一次"看过但没有可做"的跳过（用于冷却，避免 daemon 每秒重算）。 */
+declare function recordSkip(config: AutoSchemaConfig): void;
+/** 建议的 cron 行（用户粘到自己机器的 crontab）。 */
+declare function cronLine(config: AutoSchemaConfig, cliPath?: string): string;
+
+/**
+ * AutoSchema — 消化游标：记住"哪些日记已经被吸收进图式"。
+ *
+ * 为什么要它：
+ *   - 定时触发若每次都取"最近 N 篇"，会把同一批日记反复分析（重复烧 token、重复提同样的建议）。
+ *   - 只喂**未消化**的日记，非平衡才真正对应"新经验"。
+ *
+ * 游标存在 `<stateRoot>/state/cursor.json`，`apply`（或自动模式的 propose 成功）后标记消化；
+ * 失败不标记，下次重试同一批。
+ */
+
+declare function cursorFile(stateRoot: string): string;
+declare function emptyCursor(): DigestCursor;
+declare function loadCursor(stateRoot: string): DigestCursor;
+declare function saveCursor(stateRoot: string, cursor: DigestCursor): void;
+declare function isDigested(cursor: DigestCursor, eventId: string): boolean;
+declare function isPending(cursor: DigestCursor, eventId: string): boolean;
+/** 已吸收或已提出建议——两种都不该再喂一次。 */
+declare function isSettled(cursor: DigestCursor, eventId: string): boolean;
+/** 只保留未消化过的日记（保持传入顺序）。 */
+declare function filterUndigested(cursor: DigestCursor, entries: DiaryEntry[]): DiaryEntry[];
+/** 统计未消化数量（不读正文，只看 id）。 */
+declare function countUndigested(cursor: DigestCursor, eventIds: string[]): number;
+/** 标记消化；返回新的游标（不落盘）。 */
+/** 标记"已吸收"（真正写回了图式）。 */
+declare function markDigested(cursor: DigestCursor, eventIds: string[], runId?: string): DigestCursor;
+/** 标记"已提出建议、待人工落盘"。 */
+declare function markProposed(cursor: DigestCursor, eventIds: string[], runId?: string): DigestCursor;
+/** 待落盘的事件 id。 */
+declare function pendingEventIds(cursor: DigestCursor): string[];
+/** 清空待落盘标记（拒绝建议时用）。 */
+declare function clearProposed(cursor: DigestCursor): DigestCursor;
+/** 只记录"跑过但没消化"（证据不足/空结果时也算把这一批看过一遍）。 */
+declare function markRun(cursor: DigestCursor, runId?: string): DigestCursor;
+/** 最近一次运行距今多久（毫秒）；没跑过返回 Infinity。 */
+declare function msSinceLastRun(cursor: DigestCursor, now?: number): number;
+/** 清空消化记录（配合 --reset-cursor）。 */
+declare function resetCursor(stateRoot: string): void;
+
+/**
+ * AutoSchema — 触发执行器：把"该不该跑"与"跑什么"接起来。
+ *
+ * 供 tick / daemon / hook 三条路径共用，保证三种触发方式的语义完全一致：
+ *   闸门（冷却 + 未消化数量）→ 取未消化日记 → 分析 → 按 applyMode 落盘或存为待审。
+ */
+
+interface TickOptions {
+    config: AutoSchemaConfig;
+    client?: ChatClient;
+    logger?: Logger;
+    /** manual=强制跑（忽略闸门）；schedule/hook=按闸门判断。 */
+    origin: 'manual' | 'schedule' | 'hook';
+    /** 仅检查不执行。 */
+    dryCheck?: boolean;
+}
+interface TickResult {
+    ran: boolean;
+    due?: DueCheck;
+    result?: RunResult;
+    /** 落盘还是仅出建议。 */
+    mode: 'applied' | 'proposed' | 'skipped';
+    message: string;
+}
+/** 跑一次（受闸门约束，除非 origin=manual）。 */
+declare function tick(options: TickOptions): Promise<TickResult>;
+/** 供 hook 使用：把最近的运行时间写进游标，避免同一生命周期点连跑。 */
+declare function touchRun(config: AutoSchemaConfig): void;
 
 interface LogLevel {
     level?: 'debug' | 'info' | 'warn' | 'error';
@@ -357,4 +561,4 @@ declare function silentLogger(): {
     error: () => void;
 };
 
-export { ANALYSIS_GUIDE, type AccommodationItem, type Analysis, AnalysisError, type ApplyResult, type AssimilationItem, type AutoSchemaConfig, type ChatClient, DeepseekClient, type DeepseekConfig, DeepseekError, type DiaryEntry, type Disequilibrium, type Evidence, type Logger, RESPONSE_CONTRACT, type RunOptions, type RunResult, SECTION_LABELS, type SchemaDoc, type Section, VERSION, applyChanges, buildAnalysisRequest, collectDiaries, configFile, createLogger, defaultConfig, ensureConfigFile, eventsDir, extractJsonObject, findClosestIndex, gatherDiaries, itemCount, listEventIds, listHistory, loadConfig, normalizeAnalysis, parseAnalysisResponse, parseSchemaDoc, readDiary, readSchema, readSchemaDoc, renderDiaries, renderReport, renderSchema, renderSchemaDoc, resolveApiKey, run, silentLogger, snapshotSchema, validateConfig, writeSchemaDoc };
+export { ANALYSIS_GUIDE, type AccommodationItem, type Analysis, AnalysisError, type ApplyResult, type AssimilationItem, type AutoSchemaConfig, type ChatClient, DeepseekClient, type DeepseekConfig, DeepseekError, type DiaryEntry, type DigestConfig, type DigestCursor, type Disequilibrium, type DueCheck, type Evidence, type HookEvent, type HookTriggerConfig, type Logger, type PendingProposal, RESPONSE_CONTRACT, type RunOptions, type RunResult, SECTION_LABELS, type ScheduleTriggerConfig, type SchemaDoc, type Section, type TickOptions, type TickResult, type TriggerConfig, type TriggerMode, VERSION, applyChanges, applyProposal, buildAnalysisRequest, checkDue, checkHookDue, clearPending, clearProposed, collectDiaries, configFile, countUndigested, createLogger, cronLine, cursorFile, defaultConfig, emptyCursor, ensureConfigFile, eventsDir, extractJsonObject, filterUndigested, findClosestIndex, gatherDiaries, isDigested, isPending, isSettled, itemCount, listEventIds, listHistory, loadConfig, loadCursor, loadPending, markDigested, markProposed, markRun, msSinceLastRun, nextAtTime, normalizeAnalysis, parseAnalysisResponse, parseSchemaDoc, pendingEventIds, pendingFile, readDiary, readSchema, readSchemaDoc, recordSkip, renderDiaries, renderReport, renderSchema, renderSchemaDoc, resetCursor, resolveApiKey, run, saveCursor, silentLogger, snapshotSchema, tick, touchRun, validateConfig, writeSchemaDoc };

@@ -19,6 +19,20 @@ export function defaultConfig(): AutoSchemaConfig {
     diaryChars: 1800,
     maxInputChars: 60_000,
     stateRoot: DEFAULT_STATE_ROOT,
+    trigger: {
+      modes: ['manual'],
+      cooldownMs: 3_600_000,
+      minNewDiaries: 5,
+      applyMode: 'propose',
+      schedule: { intervalMinutes: 1_440, skipIfOverdueMinutes: 720 },
+      hook: { events: ['compaction/start'], cooldownMs: 1_800_000 },
+    },
+    digest: {
+      limit: 30,
+      onlyUndigested: true,
+      diaryChars: 1800,
+      maxInputChars: 60_000,
+    },
     deepseek: {
       baseUrl: 'https://api.deepseek.com',
       model: 'deepseek-chat',
@@ -71,6 +85,24 @@ export function loadConfig(options: { stateRoot?: string; patch?: DeepPartial<Au
   merged.maxInputChars = Math.round(clamp(merged.maxInputChars, 2_000, 400_000))
   merged.diaryLimit = Math.round(clamp(merged.diaryLimit, 1, 500))
   merged.deepseek.temperature = clamp(merged.deepseek.temperature, 0, 2)
+  // 兼容：旧字段 diaryLimit/diaryChars/maxInputChars 与 digest.* 双向对齐（digest 为准）
+  if (onDisk?.digest !== undefined) {
+    merged.diaryLimit = merged.digest.limit
+    merged.diaryChars = merged.digest.diaryChars
+    merged.maxInputChars = merged.digest.maxInputChars
+  } else {
+    merged.digest.limit = merged.diaryLimit
+    merged.digest.diaryChars = merged.diaryChars
+    merged.digest.maxInputChars = merged.maxInputChars
+  }
+  merged.digest.limit = Math.round(clamp(merged.digest.limit, 1, 500))
+  merged.digest.diaryChars = Math.round(clamp(merged.digest.diaryChars, 200, 20_000))
+  merged.digest.maxInputChars = Math.round(clamp(merged.digest.maxInputChars, 2_000, 400_000))
+  if (!Array.isArray(merged.trigger.modes) || merged.trigger.modes.length === 0) merged.trigger.modes = ['manual']
+  merged.trigger.cooldownMs = Math.max(0, merged.trigger.cooldownMs)
+  merged.trigger.hook.cooldownMs = Math.max(0, merged.trigger.hook.cooldownMs)
+  merged.trigger.minNewDiaries = Math.max(1, Math.round(merged.trigger.minNewDiaries))
+  merged.trigger.schedule.intervalMinutes = Math.max(1, Math.round(merged.trigger.schedule.intervalMinutes))
   merged.agentsFile = path.resolve(merged.agentsFile)
   merged.memoryRoot = path.resolve(merged.memoryRoot)
   return merged
@@ -91,6 +123,23 @@ export function validateConfig(config: AutoSchemaConfig): string[] {
   if (!Number.isFinite(config.diaryLimit) || config.diaryLimit < 1) problems.push('diaryLimit 必须 ≥ 1')
   if (!/^https?:\/\//u.test(config.deepseek.baseUrl)) problems.push('deepseek.baseUrl 必须是 http(s)')
   if (!config.deepseek.model) problems.push('deepseek.model 不能为空')
+  const allowedModes = ['manual', 'schedule', 'hook']
+  if (!config.trigger.modes.every((mode) => allowedModes.includes(mode))) {
+    problems.push('trigger.modes 只能是 manual / schedule / hook')
+  }
+  if (config.trigger.modes.includes('schedule') && config.trigger.schedule.intervalMinutes < 1) {
+    problems.push('trigger.schedule.intervalMinutes 必须 ≥ 1')
+  }
+  const allowedHooks = ['compaction/start', 'agent/pre-step', 'agent/idle', 'session/start']
+  if (!config.trigger.hook.events.every((event) => allowedHooks.includes(event))) {
+    problems.push('trigger.hook.events 只能取 compaction/start、agent/pre-step、agent/idle、session/start')
+  }
+  if (config.trigger.modes.includes('hook') && config.trigger.hook.events.length === 0) {
+    problems.push('hook 模式下 trigger.hook.events 不能为空（要挂"特定的"生命周期点）')
+  }
+  if (config.trigger.applyMode !== 'propose' && config.trigger.applyMode !== 'apply') {
+    problems.push("trigger.applyMode 只能是 propose 或 apply")
+  }
   return problems
 }
 

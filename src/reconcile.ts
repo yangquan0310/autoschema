@@ -13,10 +13,20 @@ import path from 'node:path'
 
 import { applyChanges, parseSchemaDoc, renderSchemaDoc, writeSchemaDoc } from './agents-md.js'
 import { collectDiaries, renderDiaries } from './diaries.js'
+import { filterUndigested, loadCursor, markDigested, markProposed, markRun, saveCursor } from './cursor.js'
 import { DeepseekClient } from './deepseek.js'
 import { buildAnalysisRequest, parseAnalysisResponse } from './prompt.js'
 import { resolveApiKey } from './config.js'
-import { createLogger, ensureDir, nowIso, readTextFile, timestampForFile, writeJsonFile, writeTextAtomic } from './util.js'
+import {
+  createLogger,
+  ensureDir,
+  nowIso,
+  readJsonFile,
+  readTextFile,
+  timestampForFile,
+  writeJsonFile,
+  writeTextAtomic,
+} from './util.js'
 import { SECTION_LABELS } from './types.js'
 import type {
   Analysis,
@@ -24,6 +34,7 @@ import type {
   ChatClient,
   DiaryEntry,
   Logger,
+  PendingProposal,
   SchemaDoc,
 } from './types.js'
 
@@ -38,10 +49,20 @@ export interface RunOptions {
   limit?: number
   /** 覆盖：时间下界。 */
   since?: string
+  /** 覆盖：是否只喂未消化的日记（默认取 config.digest.onlyUndigested）。 */
+  onlyUndigested?: boolean
+  /** 覆盖：跑完是否标记消化（默认 true；失败/异常不标记）。 */
+  markDigested?: boolean
+  /** 运行批次 id（测试可注入）。 */
+  runId?: string
 }
 
 export interface RunResult {
   analysis: Analysis
+  /** 本次实际消化（喂进去）的日记 id。 */
+  digestedIds: string[]
+  /** 因已消化被跳过的篇数。 */
+  skippedDigested: number
   /** 变更前的图式。 */
   before: SchemaDoc
   /** 变更后的图式（dryRun 时等于 before 加变更的草案，不落盘）。 */
@@ -53,6 +74,8 @@ export interface RunResult {
   /** 写回成功后的快照路径。 */
   snapshot?: string
   wrote: boolean
+  /** 建议已存为待落盘（供 `apply` 直接消费，不必再调模型）。 */
+  pendingSaved: boolean
 }
 
 /** 读取当前图式；文件不存在时返回空图式（而不是报错）。 */
@@ -101,10 +124,16 @@ export async function run(options: RunOptions): Promise<RunResult> {
   const dryRun = options.dryRun !== false
 
   const before = readSchema(config)
-  const diaries = gatherDiaries(config, options.limit, options.since)
+  const onlyUndigested = options.onlyUndigested ?? config.digest.onlyUndigested
+  const cursor = loadCursor(config.stateRoot)
+  const gathered = gatherDiaries(config, options.limit, options.since)
+  const diaries = onlyUndigested ? filterUndigested(cursor, gathered) : gathered
+  const skippedDigested = gathered.length - diaries.length
   if (diaries.length === 0) {
     throw new Error(
-      `没有可用日记：${config.memoryRoot}/events 为空，或 since/limit 过滤后无内容。先跑一次 AutoBioMemory 的整理。`,
+      gathered.length === 0
+        ? `没有可用日记：${config.memoryRoot}/events 为空，或 since/limit 过滤后无内容。先跑一次 AutoBioMemory 的整理。`
+        : `没有"未消化"的日记（最近 ${gathered.length} 篇都已吸收）。用 --all 或 digest.onlyUndigested=false 重新分析全部。`,
     )
   }
   logger.info(`图式：风格 ${before.style.length} / 信念 ${before.belief.length} / 价值观 ${before.value.length} 条；日记 ${diaries.length} 篇`)
@@ -131,8 +160,27 @@ export async function run(options: RunOptions): Promise<RunResult> {
     logger.info(`已写回 ${config.agentsFile}（快照：${snapshot}）`)
   }
 
+  const runId = options.runId ?? nowIso()
+  const ids = diaries.map((entry) => entry.eventId)
+  const proposedCount = analysis.assimilation.length + analysis.accommodation.length
+  let pendingSaved = false
+  if (options.markDigested !== false) {
+    const next = wrote
+      ? markDigested(cursor, ids, runId)
+      : proposedCount > 0
+        ? markProposed(cursor, ids, runId)
+        : markRun(cursor, runId)
+    saveCursor(config.stateRoot, next)
+    if (!wrote && proposedCount > 0) {
+      writeJsonFile(pendingFile(config.stateRoot), { at: nowIso(), runId, analysis, eventIds: ids })
+      pendingSaved = true
+    }
+  }
+
   const result: RunResult = {
     analysis,
+    digestedIds: diaries.map((entry) => entry.eventId),
+    skippedDigested,
     before,
     after: merged.doc,
     applied: merged.applied,
@@ -140,6 +188,7 @@ export async function run(options: RunOptions): Promise<RunResult> {
     diaries,
     rendered,
     wrote,
+    pendingSaved,
     ...(snapshot === undefined ? {} : { snapshot }),
   }
   writeJsonFile(path.join(config.stateRoot, 'last-run.json'), {
@@ -162,6 +211,52 @@ function requireApiKey(config: AutoSchemaConfig): string {
     )
   }
   return key
+}
+
+/** 待落盘建议的位置。 */
+export function pendingFile(stateRoot: string): string {
+  return path.join(stateRoot, 'state', 'pending.json')
+}
+
+/** 读取待落盘建议。 */
+export function loadPending(config: AutoSchemaConfig): PendingProposal | undefined {
+  return readJsonFile<PendingProposal>(pendingFile(config.stateRoot))
+}
+
+export function clearPending(config: AutoSchemaConfig): void {
+  try {
+    fs.rmSync(pendingFile(config.stateRoot))
+  } catch {
+    /* 不存在即视为已清 */
+  }
+}
+
+/**
+ * 直接落盘一份已算好的建议（`analyze` 之后 `apply`，不再调模型）。
+ */
+export function applyProposal(
+  config: AutoSchemaConfig,
+  proposal: PendingProposal,
+  options: { runId?: string } = {},
+): { after: SchemaDoc; applied: { assimilation: number; accommodation: number }; skipped: string[]; snapshot?: string; rendered: string } {
+  const before = readSchema(config)
+  const merged = applyChanges(before, proposal.analysis.assimilation, proposal.analysis.accommodation)
+  const rendered = renderSchemaDoc(merged.doc)
+  let snapshot: string | undefined
+  if (merged.applied.assimilation + merged.applied.accommodation > 0) {
+    snapshot = snapshotSchema(config, readTextFile(config.agentsFile) ?? '')
+    writeSchemaDoc(config.agentsFile, merged.doc)
+  }
+  const cursor = loadCursor(config.stateRoot)
+  saveCursor(config.stateRoot, markDigested(cursor, proposal.eventIds, options.runId ?? proposal.runId))
+  clearPending(config)
+  return {
+    after: merged.doc,
+    applied: merged.applied,
+    skipped: merged.skipped,
+    rendered,
+    ...(snapshot === undefined ? {} : { snapshot }),
+  }
 }
 
 /** 人类可读报告（CLI 与测试共用）。 */

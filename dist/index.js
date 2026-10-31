@@ -8,7 +8,7 @@ var SECTION_LABELS = {
 // src/constants.ts
 import os from "os";
 import path from "path";
-var VERSION = "0.1.0";
+var VERSION = "0.2.0";
 var DEFAULT_AGENTS_FILE = path.join(os.homedir(), ".dsh", "AGENTS.md");
 var DEFAULT_MEMORY_ROOT = path.join(os.homedir(), ".autobiomemory");
 var DEFAULT_STATE_ROOT = path.join(os.homedir(), ".autoschema");
@@ -125,6 +125,20 @@ function defaultConfig() {
     diaryChars: 1800,
     maxInputChars: 6e4,
     stateRoot: DEFAULT_STATE_ROOT,
+    trigger: {
+      modes: ["manual"],
+      cooldownMs: 36e5,
+      minNewDiaries: 5,
+      applyMode: "propose",
+      schedule: { intervalMinutes: 1440, skipIfOverdueMinutes: 720 },
+      hook: { events: ["compaction/start"], cooldownMs: 18e5 }
+    },
+    digest: {
+      limit: 30,
+      onlyUndigested: true,
+      diaryChars: 1800,
+      maxInputChars: 6e4
+    },
     deepseek: {
       baseUrl: "https://api.deepseek.com",
       model: "deepseek-chat",
@@ -166,6 +180,23 @@ function loadConfig(options = {}) {
   merged.maxInputChars = Math.round(clamp(merged.maxInputChars, 2e3, 4e5));
   merged.diaryLimit = Math.round(clamp(merged.diaryLimit, 1, 500));
   merged.deepseek.temperature = clamp(merged.deepseek.temperature, 0, 2);
+  if (onDisk?.digest !== void 0) {
+    merged.diaryLimit = merged.digest.limit;
+    merged.diaryChars = merged.digest.diaryChars;
+    merged.maxInputChars = merged.digest.maxInputChars;
+  } else {
+    merged.digest.limit = merged.diaryLimit;
+    merged.digest.diaryChars = merged.diaryChars;
+    merged.digest.maxInputChars = merged.maxInputChars;
+  }
+  merged.digest.limit = Math.round(clamp(merged.digest.limit, 1, 500));
+  merged.digest.diaryChars = Math.round(clamp(merged.digest.diaryChars, 200, 2e4));
+  merged.digest.maxInputChars = Math.round(clamp(merged.digest.maxInputChars, 2e3, 4e5));
+  if (!Array.isArray(merged.trigger.modes) || merged.trigger.modes.length === 0) merged.trigger.modes = ["manual"];
+  merged.trigger.cooldownMs = Math.max(0, merged.trigger.cooldownMs);
+  merged.trigger.hook.cooldownMs = Math.max(0, merged.trigger.hook.cooldownMs);
+  merged.trigger.minNewDiaries = Math.max(1, Math.round(merged.trigger.minNewDiaries));
+  merged.trigger.schedule.intervalMinutes = Math.max(1, Math.round(merged.trigger.schedule.intervalMinutes));
   merged.agentsFile = path3.resolve(merged.agentsFile);
   merged.memoryRoot = path3.resolve(merged.memoryRoot);
   return merged;
@@ -184,6 +215,23 @@ function validateConfig(config) {
   if (!Number.isFinite(config.diaryLimit) || config.diaryLimit < 1) problems.push("diaryLimit \u5FC5\u987B \u2265 1");
   if (!/^https?:\/\//u.test(config.deepseek.baseUrl)) problems.push("deepseek.baseUrl \u5FC5\u987B\u662F http(s)");
   if (!config.deepseek.model) problems.push("deepseek.model \u4E0D\u80FD\u4E3A\u7A7A");
+  const allowedModes = ["manual", "schedule", "hook"];
+  if (!config.trigger.modes.every((mode) => allowedModes.includes(mode))) {
+    problems.push("trigger.modes \u53EA\u80FD\u662F manual / schedule / hook");
+  }
+  if (config.trigger.modes.includes("schedule") && config.trigger.schedule.intervalMinutes < 1) {
+    problems.push("trigger.schedule.intervalMinutes \u5FC5\u987B \u2265 1");
+  }
+  const allowedHooks = ["compaction/start", "agent/pre-step", "agent/idle", "session/start"];
+  if (!config.trigger.hook.events.every((event) => allowedHooks.includes(event))) {
+    problems.push("trigger.hook.events \u53EA\u80FD\u53D6 compaction/start\u3001agent/pre-step\u3001agent/idle\u3001session/start");
+  }
+  if (config.trigger.modes.includes("hook") && config.trigger.hook.events.length === 0) {
+    problems.push('hook \u6A21\u5F0F\u4E0B trigger.hook.events \u4E0D\u80FD\u4E3A\u7A7A\uFF08\u8981\u6302"\u7279\u5B9A\u7684"\u751F\u547D\u5468\u671F\u70B9\uFF09');
+  }
+  if (config.trigger.applyMode !== "propose" && config.trigger.applyMode !== "apply") {
+    problems.push("trigger.applyMode \u53EA\u80FD\u662F propose \u6216 apply");
+  }
   return problems;
 }
 function resolveApiKey(config) {
@@ -750,7 +798,84 @@ var DeepseekClient = class {
 
 // src/reconcile.ts
 import fs3 from "fs";
+import path6 from "path";
+
+// src/cursor.ts
 import path5 from "path";
+var VERSION2 = 1;
+function cursorFile(stateRoot) {
+  return path5.join(stateRoot, "state", "cursor.json");
+}
+function emptyCursor() {
+  return { version: VERSION2, digested: {}, proposed: {} };
+}
+function loadCursor(stateRoot) {
+  const raw = readJsonFile(cursorFile(stateRoot));
+  if (raw === void 0 || typeof raw !== "object" || typeof raw.digested !== "object" || raw.digested === null) {
+    return emptyCursor();
+  }
+  return {
+    ...emptyCursor(),
+    ...raw,
+    version: VERSION2,
+    digested: raw.digested ?? {},
+    proposed: raw.proposed ?? {}
+  };
+}
+function saveCursor(stateRoot, cursor) {
+  ensureDir(path5.join(stateRoot, "state"));
+  writeJsonFile(cursorFile(stateRoot), { ...cursor, version: VERSION2 });
+}
+function isDigested(cursor, eventId) {
+  return cursor.digested[eventId] !== void 0;
+}
+function isPending(cursor, eventId) {
+  return cursor.proposed[eventId] !== void 0;
+}
+function isSettled(cursor, eventId) {
+  return isDigested(cursor, eventId) || isPending(cursor, eventId);
+}
+function filterUndigested(cursor, entries) {
+  return entries.filter((entry) => !isSettled(cursor, entry.eventId));
+}
+function countUndigested(cursor, eventIds) {
+  return eventIds.reduce((sum, id) => isSettled(cursor, id) ? sum : sum + 1, 0);
+}
+function markDigested(cursor, eventIds, runId = nowIso()) {
+  const digested = { ...cursor.digested };
+  const proposed = { ...cursor.proposed };
+  const at = nowIso();
+  for (const eventId of eventIds) {
+    digested[eventId] = { at, runId };
+    delete proposed[eventId];
+  }
+  return { ...cursor, digested, proposed, lastRunAt: at, lastRunId: runId, skippedRuns: 0 };
+}
+function markProposed(cursor, eventIds, runId = nowIso()) {
+  const proposed = { ...cursor.proposed };
+  const at = nowIso();
+  for (const eventId of eventIds) if (cursor.digested[eventId] === void 0) proposed[eventId] = { at, runId };
+  return { ...cursor, proposed, lastRunAt: at, lastRunId: runId, skippedRuns: 0 };
+}
+function pendingEventIds(cursor) {
+  return Object.keys(cursor.proposed);
+}
+function clearProposed(cursor) {
+  return { ...cursor, proposed: {} };
+}
+function markRun(cursor, runId = nowIso()) {
+  return { ...cursor, lastRunAt: nowIso(), lastRunId: runId };
+}
+function msSinceLastRun(cursor, now = Date.now()) {
+  if (cursor.lastRunAt === void 0) return Number.POSITIVE_INFINITY;
+  const parsed = Date.parse(cursor.lastRunAt);
+  return Number.isNaN(parsed) ? Number.POSITIVE_INFINITY : now - parsed;
+}
+function resetCursor(stateRoot) {
+  saveCursor(stateRoot, emptyCursor());
+}
+
+// src/reconcile.ts
 function readSchema(config) {
   const raw = readTextFile(config.agentsFile) ?? "";
   return parseSchemaDoc(raw);
@@ -764,17 +889,17 @@ function gatherDiaries(config, limit, since) {
   });
 }
 function snapshotSchema(config, raw) {
-  const historyDir = path5.join(config.stateRoot, "history");
+  const historyDir = path6.join(config.stateRoot, "history");
   ensureDir(historyDir);
   const stamp = timestampForFile();
-  let file = path5.join(historyDir, `AGENTS-${stamp}.md`);
+  let file = path6.join(historyDir, `AGENTS-${stamp}.md`);
   let counter = 1;
   while (fs3.existsSync(file)) {
-    file = path5.join(historyDir, `AGENTS-${stamp}-${counter}.md`);
+    file = path6.join(historyDir, `AGENTS-${stamp}-${counter}.md`);
     counter += 1;
   }
   writeTextAtomic(file, raw);
-  const logFile = path5.join(historyDir, "changelog.jsonl");
+  const logFile = path6.join(historyDir, "changelog.jsonl");
   const line = JSON.stringify({ at: nowIso(), file, chars: raw.length });
   fs3.appendFileSync(logFile, `${line}
 `, "utf8");
@@ -785,10 +910,14 @@ async function run(options) {
   const logger = options.logger ?? createLogger();
   const dryRun = options.dryRun !== false;
   const before = readSchema(config);
-  const diaries = gatherDiaries(config, options.limit, options.since);
+  const onlyUndigested = options.onlyUndigested ?? config.digest.onlyUndigested;
+  const cursor = loadCursor(config.stateRoot);
+  const gathered = gatherDiaries(config, options.limit, options.since);
+  const diaries = onlyUndigested ? filterUndigested(cursor, gathered) : gathered;
+  const skippedDigested = gathered.length - diaries.length;
   if (diaries.length === 0) {
     throw new Error(
-      `\u6CA1\u6709\u53EF\u7528\u65E5\u8BB0\uFF1A${config.memoryRoot}/events \u4E3A\u7A7A\uFF0C\u6216 since/limit \u8FC7\u6EE4\u540E\u65E0\u5185\u5BB9\u3002\u5148\u8DD1\u4E00\u6B21 AutoBioMemory \u7684\u6574\u7406\u3002`
+      gathered.length === 0 ? `\u6CA1\u6709\u53EF\u7528\u65E5\u8BB0\uFF1A${config.memoryRoot}/events \u4E3A\u7A7A\uFF0C\u6216 since/limit \u8FC7\u6EE4\u540E\u65E0\u5185\u5BB9\u3002\u5148\u8DD1\u4E00\u6B21 AutoBioMemory \u7684\u6574\u7406\u3002` : `\u6CA1\u6709"\u672A\u6D88\u5316"\u7684\u65E5\u8BB0\uFF08\u6700\u8FD1 ${gathered.length} \u7BC7\u90FD\u5DF2\u5438\u6536\uFF09\u3002\u7528 --all \u6216 digest.onlyUndigested=false \u91CD\u65B0\u5206\u6790\u5168\u90E8\u3002`
     );
   }
   logger.info(`\u56FE\u5F0F\uFF1A\u98CE\u683C ${before.style.length} / \u4FE1\u5FF5 ${before.belief.length} / \u4EF7\u503C\u89C2 ${before.value.length} \u6761\uFF1B\u65E5\u8BB0 ${diaries.length} \u7BC7`);
@@ -811,8 +940,22 @@ async function run(options) {
     wrote = true;
     logger.info(`\u5DF2\u5199\u56DE ${config.agentsFile}\uFF08\u5FEB\u7167\uFF1A${snapshot}\uFF09`);
   }
+  const runId = options.runId ?? nowIso();
+  const ids = diaries.map((entry) => entry.eventId);
+  const proposedCount = analysis.assimilation.length + analysis.accommodation.length;
+  let pendingSaved = false;
+  if (options.markDigested !== false) {
+    const next = wrote ? markDigested(cursor, ids, runId) : proposedCount > 0 ? markProposed(cursor, ids, runId) : markRun(cursor, runId);
+    saveCursor(config.stateRoot, next);
+    if (!wrote && proposedCount > 0) {
+      writeJsonFile(pendingFile(config.stateRoot), { at: nowIso(), runId, analysis, eventIds: ids });
+      pendingSaved = true;
+    }
+  }
   const result = {
     analysis,
+    digestedIds: diaries.map((entry) => entry.eventId),
+    skippedDigested,
     before,
     after: merged.doc,
     applied: merged.applied,
@@ -820,9 +963,10 @@ async function run(options) {
     diaries,
     rendered,
     wrote,
+    pendingSaved,
     ...snapshot === void 0 ? {} : { snapshot }
   };
-  writeJsonFile(path5.join(config.stateRoot, "last-run.json"), {
+  writeJsonFile(path6.join(config.stateRoot, "last-run.json"), {
     at: nowIso(),
     dryRun,
     equilibriumScore: analysis.equilibriumScore,
@@ -841,6 +985,38 @@ function requireApiKey(config) {
     );
   }
   return key;
+}
+function pendingFile(stateRoot) {
+  return path6.join(stateRoot, "state", "pending.json");
+}
+function loadPending(config) {
+  return readJsonFile(pendingFile(config.stateRoot));
+}
+function clearPending(config) {
+  try {
+    fs3.rmSync(pendingFile(config.stateRoot));
+  } catch {
+  }
+}
+function applyProposal(config, proposal, options = {}) {
+  const before = readSchema(config);
+  const merged = applyChanges(before, proposal.analysis.assimilation, proposal.analysis.accommodation);
+  const rendered = renderSchemaDoc(merged.doc);
+  let snapshot;
+  if (merged.applied.assimilation + merged.applied.accommodation > 0) {
+    snapshot = snapshotSchema(config, readTextFile(config.agentsFile) ?? "");
+    writeSchemaDoc(config.agentsFile, merged.doc);
+  }
+  const cursor = loadCursor(config.stateRoot);
+  saveCursor(config.stateRoot, markDigested(cursor, proposal.eventIds, options.runId ?? proposal.runId));
+  clearPending(config);
+  return {
+    after: merged.doc,
+    applied: merged.applied,
+    skipped: merged.skipped,
+    rendered,
+    ...snapshot === void 0 ? {} : { snapshot }
+  };
 }
 function renderReport(result) {
   const { analysis, applied, skipped } = result;
@@ -885,7 +1061,7 @@ function renderReport(result) {
   return lines.join("\n");
 }
 function listHistory(config) {
-  const logFile = path5.join(config.stateRoot, "history", "changelog.jsonl");
+  const logFile = path6.join(config.stateRoot, "history", "changelog.jsonl");
   const text = readTextFile(logFile);
   if (text === void 0) return [];
   return text.split("\n").filter((line) => line.trim() !== "").map((line) => {
@@ -896,6 +1072,171 @@ function listHistory(config) {
     }
   }).filter((entry) => entry !== void 0);
 }
+
+// src/schedule.ts
+function nextAtTime(now, atTime) {
+  const match = /^(\d{1,2}):(\d{2})$/u.exec(atTime.trim());
+  if (match === null) return void 0;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (hours > 23 || minutes > 59) return void 0;
+  const target = new Date(now);
+  target.setHours(hours, minutes, 0, 0);
+  if (target.getTime() <= now.getTime()) target.setDate(target.getDate() + 1);
+  return target.getTime();
+}
+function checkDue(config, now = /* @__PURE__ */ new Date()) {
+  if (!config.trigger.modes.includes("schedule")) {
+    return { due: false, reason: "trigger.modes \u672A\u542F\u7528 schedule", waitMs: Number.POSITIVE_INFINITY, undigested: 0 };
+  }
+  const cursor = loadCursor(config.stateRoot);
+  const undigested = countUndigested(cursor, listEventIds(config.memoryRoot));
+  if (undigested < config.trigger.minNewDiaries) {
+    return {
+      due: false,
+      reason: `\u672A\u6D88\u5316\u65E5\u8BB0\u4E0D\u8DB3\uFF08${undigested} < ${config.trigger.minNewDiaries}\uFF09`,
+      waitMs: 0,
+      undigested
+    };
+  }
+  const sinceLast = msSinceLastRun(cursor, now.getTime());
+  const cooldown = Math.max(config.trigger.cooldownMs, config.trigger.schedule.intervalMinutes * 6e4);
+  if (sinceLast < cooldown) {
+    const waitMs = cooldown - sinceLast;
+    return {
+      due: false,
+      reason: `\u51B7\u5374\u4E2D\uFF08\u8FD8\u9700 ${Math.ceil(waitMs / 6e4)} \u5206\u949F\uFF1B\u95F4\u9694 ${Math.round(cooldown / 6e4)} \u5206\u949F\uFF09`,
+      waitMs,
+      undigested
+    };
+  }
+  const atTime = config.trigger.schedule.atTime;
+  if (atTime !== void 0) {
+    const next = nextAtTime(now, atTime);
+    if (next === void 0) {
+      return { due: false, reason: `trigger.schedule.atTime \u683C\u5F0F\u65E0\u6548\uFF1A${atTime}\uFF08\u5E94\u4E3A HH:MM\uFF09`, waitMs: 0, undigested };
+    }
+    const todayTarget = new Date(now);
+    const [h, m] = atTime.split(":").map(Number);
+    todayTarget.setHours(h, m, 0, 0);
+    const lastRun = cursor.lastRunAt === void 0 ? 0 : Date.parse(cursor.lastRunAt);
+    const alreadyRanSinceTarget = !Number.isNaN(lastRun) && lastRun >= todayTarget.getTime();
+    if (now.getTime() >= todayTarget.getTime() && !alreadyRanSinceTarget) {
+      const overdueMs = now.getTime() - todayTarget.getTime();
+      const skipAfter = config.trigger.schedule.skipIfOverdueMinutes * 6e4;
+      if (skipAfter > 0 && overdueMs > skipAfter) {
+        return {
+          due: false,
+          reason: `\u5DF2\u9519\u8FC7 ${atTime} \u7684\u7A97\u53E3 ${Math.round(overdueMs / 6e4)} \u5206\u949F\uFF08skipIfOverdueMinutes=${config.trigger.schedule.skipIfOverdueMinutes}\uFF09`,
+          waitMs: next - now.getTime(),
+          undigested
+        };
+      }
+      return { due: true, reason: `\u5230\u8FBE\u6BCF\u65E5\u56FA\u5B9A\u65F6\u523B ${atTime}`, waitMs: 0, undigested };
+    }
+    return {
+      due: false,
+      reason: alreadyRanSinceTarget ? `\u4ECA\u65E5 ${atTime} \u5DF2\u8DD1\u8FC7` : `\u7B49\u5F85\u6BCF\u65E5\u56FA\u5B9A\u65F6\u523B ${atTime}`,
+      waitMs: next - now.getTime(),
+      undigested
+    };
+  }
+  return { due: true, reason: `\u6EE1\u8DB3\u95F4\u9694 ${config.trigger.schedule.intervalMinutes} \u5206\u949F\u4E14\u65B0\u65E5\u8BB0 ${undigested} \u7BC7`, waitMs: 0, undigested };
+}
+function checkHookDue(config, now = /* @__PURE__ */ new Date()) {
+  if (!config.trigger.modes.includes("hook")) {
+    return { due: false, reason: "trigger.modes \u672A\u542F\u7528 hook", waitMs: Number.POSITIVE_INFINITY, undigested: 0 };
+  }
+  const events = config.trigger.hook.events;
+  if (events.length === 0) {
+    return { due: false, reason: "trigger.hook.events \u4E3A\u7A7A\uFF08\u672A\u9009\u62E9\u6302\u70B9\uFF09", waitMs: Number.POSITIVE_INFINITY, undigested: 0 };
+  }
+  const cursor = loadCursor(config.stateRoot);
+  const undigested = countUndigested(cursor, listEventIds(config.memoryRoot));
+  if (undigested < config.trigger.minNewDiaries) {
+    return {
+      due: false,
+      reason: `\u672A\u6D88\u5316\u65E5\u8BB0\u4E0D\u8DB3\uFF08${undigested} < ${config.trigger.minNewDiaries}\uFF09`,
+      waitMs: 0,
+      undigested
+    };
+  }
+  const cooldown = Math.max(0, config.trigger.hook.cooldownMs);
+  const sinceLast = msSinceLastRun(cursor, now.getTime());
+  if (sinceLast < cooldown) {
+    const waitMs = cooldown - sinceLast;
+    return {
+      due: false,
+      reason: `hook \u51B7\u5374\u4E2D\uFF08\u8FD8\u9700 ${Math.ceil(waitMs / 6e4)} \u5206\u949F\uFF1BcooldownMs=${cooldown}\uFF09`,
+      waitMs,
+      undigested
+    };
+  }
+  return {
+    due: true,
+    reason: `hook \u95F8\u95E8\u901A\u8FC7\uFF08\u6302\u70B9 ${events.join("\u3001")}\uFF0C\u672A\u6D88\u5316 ${undigested} \u7BC7\uFF09`,
+    waitMs: 0,
+    undigested
+  };
+}
+function recordSkip(config) {
+  const cursor = loadCursor(config.stateRoot);
+  saveCursor(config.stateRoot, { ...cursor, lastRunAt: nowIso(), skippedRuns: (cursor.skippedRuns ?? 0) + 1 });
+}
+function cronLine(config, cliPath = "autoschema") {
+  const minutes = config.trigger.schedule.intervalMinutes;
+  if (config.trigger.schedule.atTime !== void 0) {
+    const [h, m] = config.trigger.schedule.atTime.split(":");
+    return `${Number(m)} ${Number(h)} * * * ${cliPath} tick --state ${config.stateRoot} >> ${config.stateRoot}/logs/tick.log 2>&1`;
+  }
+  if (minutes % 60 === 0) {
+    return `0 */${Math.max(1, minutes / 60)} * * * ${cliPath} tick --state ${config.stateRoot} >> ${config.stateRoot}/logs/tick.log 2>&1`;
+  }
+  return `*/${minutes} * * * * ${cliPath} tick --state ${config.stateRoot} >> ${config.stateRoot}/logs/tick.log 2>&1`;
+}
+
+// src/tick.ts
+function describe(result) {
+  const parts = [
+    `\u5E73\u8861\u5EA6 ${Math.round(result.analysis.equilibriumScore * 100)}%`,
+    `\u975E\u5E73\u8861 ${result.analysis.disequilibrium.length}`,
+    `\u540C\u5316 ${result.applied.assimilation}/${result.analysis.assimilation.length}`,
+    `\u987A\u5E94 ${result.applied.accommodation}/${result.analysis.accommodation.length}`
+  ];
+  const sections = ["style", "belief", "value"].map((section) => `${SECTION_LABELS[section]}${result.after[section].length}`).join(" ");
+  return `${parts.join(" \xB7 ")}\uFF08\u56FE\u5F0F\uFF1A${sections}\uFF09`;
+}
+async function tick(options) {
+  const logger = options.logger ?? createLogger();
+  const { config } = options;
+  if (options.origin !== "manual") {
+    const due = options.origin === "hook" ? checkHookDue(config) : checkDue(config);
+    if (!due.due) {
+      if (!options.dryCheck) recordSkip(config);
+      logger.debug(`\u8DF3\u8FC7\uFF1A${due.reason}`);
+      return { ran: false, due, mode: "skipped", message: due.reason };
+    }
+  } else if (options.dryCheck) {
+    return { ran: false, due: checkDue(config), mode: "skipped", message: "manual dry-check" };
+  }
+  const applyNow = options.origin === "manual" ? false : config.trigger.applyMode === "apply";
+  const result = await run({
+    config,
+    logger,
+    dryRun: !applyNow,
+    ...options.client === void 0 ? {} : { client: options.client },
+    runId: nowIso()
+  });
+  const mode = result.wrote ? "applied" : "proposed";
+  const message = describe(result);
+  if (result.wrote) logger.info(`\u5DF2\u5199\u56DE AGENTS.md\uFF1A${message}`);
+  else logger.info(`\u5EFA\u8BAE\u5DF2\u5C31\u7EEA\uFF08\u5F85\u843D\u76D8\uFF09\uFF1A${message}`);
+  return { ran: true, result, mode, message };
+}
+function touchRun(config) {
+  const cursor = loadCursor(config.stateRoot);
+  saveCursor(config.stateRoot, { ...cursor, lastRunAt: nowIso(), skippedRuns: 0 });
+}
 export {
   ANALYSIS_GUIDE,
   AnalysisError,
@@ -905,34 +1246,61 @@ export {
   SECTION_LABELS,
   VERSION,
   applyChanges,
+  applyProposal,
   buildAnalysisRequest,
+  checkDue,
+  checkHookDue,
+  clearPending,
+  clearProposed,
   collectDiaries,
   configFile,
+  countUndigested,
   createLogger,
+  cronLine,
+  cursorFile,
   defaultConfig,
+  emptyCursor,
   ensureConfigFile,
   eventsDir,
   extractJsonObject,
+  filterUndigested,
   findClosestIndex,
   gatherDiaries,
+  isDigested,
+  isPending,
+  isSettled,
   itemCount,
   listEventIds,
   listHistory,
   loadConfig,
+  loadCursor,
+  loadPending,
+  markDigested,
+  markProposed,
+  markRun,
+  msSinceLastRun,
+  nextAtTime,
   normalizeAnalysis,
   parseAnalysisResponse,
   parseSchemaDoc,
+  pendingEventIds,
+  pendingFile,
   readDiary,
   readSchema,
   readSchemaDoc,
+  recordSkip,
   renderDiaries,
   renderReport,
   renderSchema,
   renderSchemaDoc,
+  resetCursor,
   resolveApiKey,
   run,
+  saveCursor,
   silentLogger,
   snapshotSchema,
+  tick,
+  touchRun,
   validateConfig,
   writeSchemaDoc
 };
