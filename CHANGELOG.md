@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.4] — 2026-10-31
+
+### Fixed（会挡住 dsh 启动的严重问题）
+
+- **`dsh --profile web` 启动失败：`$.events expected array but got [object Object]`。**
+  原因：`cordis.patch.yml` 里 `!!js` 表达式写成了**裸标量**，而 `events` / `cooldownMs` 的内容是三元
+  `cond ? a : b`。dsh 用 js-yaml（`JSON_SCHEMA` + `tag:yaml.org,2002:js` 标量类型）解析这一层，
+  裸标量中出现 `? … : …` 会被当成**映射的键值对**：
+  `events` 于是被解析成 `{ '[object Object]': ['compaction/start'] }`（键是那个 `!!js` 节点被
+  `String()` 的结果），插件在 schemastery 校验时报 `$.events expected array but got [object Object]`，
+  dsh 直接启动失败。`cooldownMs` 同理被切断成对象。
+  修法：`!!js` 表达式一律加双引号（`events: !!js "… ? … : ['compaction/start']"`），并在文件头写明这条约束。
+- 新增回归测试 `tests/patch.test.ts`：用与 dsh 同构的 YAML 方言解析随包发布的 `cordis.patch.yml`、
+  递归求值 `!!js` 节点（`with (ctx)` 作用域），再跑插件的 `Config` 校验；缺省与全开两套环境变量都覆盖。
+  对 0.3.3 的坏文件跑该测试会红，对 0.3.4 会绿。
+- CLI 的版本号不再硬编码，统一取 `VERSION`（`src/constants.ts`）。
+
 ## [0.3.3] — 2026-10-31
 
 ### Fixed（会挡住 dsh 启动的严重问题）

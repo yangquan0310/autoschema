@@ -257,7 +257,7 @@ interface ChatClient {
 }
 
 /** AutoSchema — 常量与默认值。 */
-declare const VERSION = "0.3.3";
+declare const VERSION = "0.3.4";
 
 /** AutoSchema — 配置：默认值、加载、校验。 */
 

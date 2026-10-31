@@ -4,18 +4,24 @@
 #   - id: autoschema
 #     config:
 #       disabled: true
+#
+# ⚠️ `!!js` 表达式一律用双引号包起来，不要写成裸标量。
+# dsh 用 js-yaml（JSON_SCHEMA + !!js 标量类型）解析这一层；裸标量里出现
+# `? … : …`（三元）或 `: ` 时，YAML 会把它当成**映射的键**，配置对象就被
+# 解析成 `{ '[object Object]': … }`，插件随后在 schemastery 校验时报
+# `$.events expected array but got [object Object]`，dsh 整个启动失败。
 - insert:
     - id: autoschema
       name: autoschema
       config:
         # 状态根（config.json / cursor / history / pending）
-        stateRoot: !!js process.env.DSH_AUTOSCHEMA_ROOT ?? undefined
+        stateRoot: !!js "process.env.DSH_AUTOSCHEMA_ROOT ?? undefined"
         # 被维护的自我图式
-        agentsFile: !!js process.env.DSH_AUTOSCHEMA_AGENTS ?? undefined
+        agentsFile: !!js "process.env.DSH_AUTOSCHEMA_AGENTS ?? undefined"
         # 经验来源（AutoBioMemory 数据根）
-        memoryRoot: !!js process.env.DSH_AUTOBIO_ROOT ?? undefined
+        memoryRoot: !!js "process.env.DSH_AUTOBIO_ROOT ?? undefined"
         # 挂哪些特定生命周期点；默认只挂压缩开始（最克制）
-        events: !!js process.env.DSH_AUTOSCHEMA_HOOKS ? JSON.parse(process.env.DSH_AUTOSCHEMA_HOOKS) : ['compaction/start']
+        events: !!js "process.env.DSH_AUTOSCHEMA_HOOKS ? JSON.parse(process.env.DSH_AUTOSCHEMA_HOOKS) : ['compaction/start']"
         # hook 冷却（毫秒）
-        cooldownMs: !!js process.env.DSH_AUTOSCHEMA_COOLDOWN ? Number(process.env.DSH_AUTOSCHEMA_COOLDOWN) : 1800000
+        cooldownMs: !!js "process.env.DSH_AUTOSCHEMA_COOLDOWN ? Number(process.env.DSH_AUTOSCHEMA_COOLDOWN) : 1800000"
         disabled: false
