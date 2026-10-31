@@ -114,6 +114,63 @@ export interface DeepseekConfig {
   retries: number
 }
 
+/** 触发方式：manual=只手动；schedule=定时（外部 cron/timer 或内置 daemon）；hook=挂 dsh 生命周期。 */
+export type TriggerMode = 'manual' | 'schedule' | 'hook'
+
+/** hook 允许挂在哪些 dsh 生命周期点（"特定的"挂点，不是任意事件）。 */
+export type HookEvent = 'compaction/start' | 'agent/pre-step' | 'agent/idle' | 'session/start'
+
+export interface ScheduleTriggerConfig {
+  /** 最小间隔（分钟）；到点且满足 minNewDiaries 才跑。 */
+  intervalMinutes: number
+  /** 可选：每天固定时刻跑（HH:MM，本地时区），设置后优先于 intervalMinutes。 */
+  atTime?: string
+  /** 错过时间窗太久的任务是否跳过（避免开机时补跑一堆）。 */
+  skipIfOverdueMinutes: number
+}
+
+export interface HookTriggerConfig {
+  /** 挂点集合；默认只有 compaction/start——特定、可控。 */
+  events: HookEvent[]
+  /** hook 触发的冷却（毫秒），避免每步都跑。 */
+  cooldownMs: number
+}
+
+export interface TriggerConfig {
+  /** 可同时开多种；manual 始终可用（CLI）。 */
+  modes: TriggerMode[]
+  /** 任何触发方式共用的最小间隔（毫秒）。 */
+  cooldownMs: number
+  /** 至少有多少篇"未消化"日记才值得跑。 */
+  minNewDiaries: number
+  /** 自动模式下的写回策略：propose=只出建议（默认），apply=直接写回。 */
+  applyMode: 'propose' | 'apply'
+  schedule: ScheduleTriggerConfig
+  hook: HookTriggerConfig
+}
+
+export interface DigestConfig {
+  /** 单次最多喂多少篇。 */
+  limit: number
+  /** 只喂未消化过的日记（默认 true）。 */
+  onlyUndigested: boolean
+  /** 单篇截断长度。 */
+  diaryChars: number
+  /** 总输入预算（字符）。 */
+  maxInputChars: number
+}
+
+/** 消化游标：哪些日记已经被"吸收"进图式。 */
+export interface DigestCursor {
+  version: number
+  /** eventId → 消化时间与所属运行批次。 */
+  digested: Record<string, { at: string; runId: string }>
+  lastRunAt?: string
+  lastRunId?: string
+  /** 连续跳过次数（用于 daemon 日志）。 */
+  skippedRuns?: number
+}
+
 export interface AutoSchemaConfig {
   version: number
   /** AGENTS.md 路径（默认 ~/.dsh/AGENTS.md）。 */
@@ -130,6 +187,8 @@ export interface AutoSchemaConfig {
   maxInputChars: number
   /** 自身状态根（快照与变更历史）。 */
   stateRoot: string
+  trigger: TriggerConfig
+  digest: DigestConfig
   deepseek: DeepseekConfig
 }
 
